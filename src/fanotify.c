@@ -1192,11 +1192,16 @@ static int load_dyn_list(DynEntry *list, int *list_count,
  * two lists differ in exactly one admission point, require_binary_sha:
  *   - allow (1): an entry without a binary SHA-512 is skipped -- a grant
  *     must prove which binary was approved or it would act as a wildcard.
+ *     The return stays boolean: 1 match, 0 no match.
  *   - deny  (0): a legacy entry without a binary SHA-512 still matches; a
- *     missing *current* hash skips the entry (re-prompt) instead of
- *     denying on an unverified identity.
- * The command-line fingerprint is compared, not recomputed: the caller
- * produces it lazily so unrelated events never pay for the hash.
+ *     stored digest with no usable current hash is INCONCLUSIVE (return
+ *     -1), never a match and never a silent fall-through: the caller
+ *     skips every grant stage and prompts instead (fail closed).
+ * Returns 1 on a conclusive match, 0 on no match, -1 on an inconclusive
+ * deny (impossible when require_binary_sha is 1, so the allow side is
+ * always 0/1).  The command-line fingerprint is compared, not
+ * recomputed: the caller produces it lazily so unrelated events never
+ * pay for the hash.
  */
 typedef const ProcChain *(*ChainProviderFn)(void *ctx);
 
@@ -1216,6 +1221,8 @@ static int dyn_match(const DynEntry *list, int count,
                      CmdlineProviderFn cmdline_fn, void *cmdline_ctx,
                      int require_binary_sha)
 {
+    int inconclusive = 0;
+
     /* File-scoped matching: an event with no resolved target can never
      * match a persisted entry (admission always requires a target). */
     if (!target || target[0] == '\0')
@@ -1239,9 +1246,18 @@ static int dyn_match(const DynEntry *list, int count,
         else
         {
             /* A stored hash with no usable current hash cannot be
-             * verified, so the entry does not match (fail secure). */
+             * verified.  Grants skip the entry (no match); a deny marks
+             * the outcome INCONCLUSIVE instead, so the pipeline skips
+             * every grant stage and prompts (fail closed) rather than
+             * granting past a denial it could not check.  Never set for
+             * a hash failure alone: only for an entry whose path keys
+             * already matched. */
             if (bin_sha512[0] == '\0')
+            {
+                if (!require_binary_sha)
+                    inconclusive = 1;
                 continue;
+            }
             if (strcmp(e->binary_sha512, bin_sha512) != 0)
                 continue;
         }
@@ -1298,7 +1314,9 @@ static int dyn_match(const DynEntry *list, int count,
             continue;
         return 1;
     }
-    return 0;
+    /* A conclusive match always returns inside the loop, so a pending
+     * inconclusive observation can only surface when nothing matched. */
+    return inconclusive ? -1 : 0;
 }
 
 /* "Always Allow" lookup: grants are strict (see dyn_match). */
@@ -1435,8 +1453,11 @@ static void dyn_allow_add(const char *binary, const char *bin_sha512,
 
 /*
  * "Always Deny" lookup: denials may be broader than grants (legacy
- * entries without a binary hash still apply) but never match on an
- * identity that cannot be verified -- see dyn_match.
+ * entries without a binary hash still apply).  Tri-state like dyn_match:
+ * 1 conclusive match, 0 no match, -1 inconclusive (the entry's path keys
+ * fit, it stores a digest, and the current hash is unavailable) -- the
+ * caller then skips grants and prompts instead of denying on an
+ * unverified identity or granting past the denial.
  */
 static int dyn_deny_match(const char *binary, const char *bin_sha512,
                           ChainProviderFn chain_fn, void *chain_ctx,
@@ -2724,6 +2745,14 @@ typedef struct
      * second dialog — the caller queues the event with its fd open. */
     int defer_on_ask;
 
+    /* Set by event_runtime_denied() when a deny entry's path keys match
+     * but its stored digest cannot be checked against an unavailable
+     * current hash (INCONCLUSIVE): event_runtime_allowed() then skips
+     * every grant stage, so the event reaches the dialog (fail closed)
+     * instead of being granted by a hash-free stage such as the file
+     * cache or [unsafe_allowlist]. */
+    int deny_inconclusive;
+
     /* Requester identity, gathered after the pre-hash deny checks. */
     pid_t ppid;
     char comm[256];
@@ -2932,15 +2961,24 @@ static void ctx_respond(EventCtx *c, unsigned int response)
 /*
  * Stage 1: sanity-check the event fd and resolve the target path from
  * the daemon's fd table.  Returns 1 when the event was decided here
- * (FAN_NOFD or an unresolvable path — both deny, fail closed).
+ * (FAN_NOFD — skipped without a response, the kernel already denied it —
+ * or an unresolvable path, which denies fail closed).
  */
 static int event_resolve(EventCtx *c)
 {
     if (c->fd_num == FAN_NOFD)
     {
-        log_msg(LOG_WARNING, "[event] FAN_NOFD for pid=%d, denying",
+        /* No event fd exists: the kernel already auto-DENIED this
+         * permission event when its fd creation failed (fanotify_read:
+         * copy_event_to_user failure -> finish_permission_event(FAN_DENY)),
+         * so FAN_OPEN_PERM+FAN_NOFD is unreachable for this fd-based
+         * group — pure defense.  Responding with fd=-1 would earn EINVAL,
+         * set g_fatal and queue a phantom retry that can never be
+         * delivered: log and skip as handled. */
+        log_msg(LOG_WARNING,
+                "[event] FAN_NOFD for pid=%d; kernel already denied, "
+                "skipping respond",
                 (int)c->ev->pid);
-        respond_event(c, FAN_DENY);
         return 1;
     }
 
@@ -3169,24 +3207,48 @@ void fanotify_test_reset_dialog_rate(void)
 
 static int event_runtime_denied(EventCtx *c)
 {
-    if (c->have_sid &&
-        session_deny_match(c->sid, c->binary, c->bin_sha512, c->target))
+    if (c->have_sid)
     {
-        log_msg(LOG_INFO, "session denylist hit: %s (pid %d, sid %d) -> %s",
-                c->binary, (int)c->ev->pid, (int)c->sid, c->target);
-        ctx_respond(c, FAN_DENY);
-        return 1;
+        int m = session_deny_match(c->sid, c->binary, c->bin_sha512,
+                                   c->target);
+
+        if (m == 1)
+        {
+            log_msg(LOG_INFO, "session denylist hit: %s (pid %d, sid %d) -> %s",
+                    c->binary, (int)c->ev->pid, (int)c->sid, c->target);
+            ctx_respond(c, FAN_DENY);
+            return 1;
+        }
+        if (m < 0)
+            c->deny_inconclusive = 1;
     }
 
-    if (g_dyn_deny_count > 0 &&
-        dyn_deny_match(c->binary, c->bin_sha512, event_chain_provider, c,
-                       c->target, event_cmdline_provider, c))
+    if (g_dyn_deny_count > 0)
     {
-        log_msg(LOG_INFO, "dynamic denylist hit: %s (pid %d) -> %s",
-                c->binary, (int)c->ev->pid, c->target);
-        ctx_respond(c, FAN_DENY);
-        return 1;
+        int m = dyn_deny_match(c->binary, c->bin_sha512, event_chain_provider,
+                               c, c->target, event_cmdline_provider, c);
+
+        if (m == 1)
+        {
+            log_msg(LOG_INFO, "dynamic denylist hit: %s (pid %d) -> %s",
+                    c->binary, (int)c->ev->pid, c->target);
+            ctx_respond(c, FAN_DENY);
+            return 1;
+        }
+        if (m < 0)
+            c->deny_inconclusive = 1;
     }
+
+    /* Inconclusive: no deny decided, but one may fit and cannot be
+     * verified.  Flag the context so the grant stages are skipped and
+     * the event reaches the dialog (fail closed); a conclusive deny
+     * would already have returned above. */
+    if (c->deny_inconclusive)
+        log_msg(LOG_INFO,
+                "deny entry matches %s (pid %d) but its stored digest is "
+                "unverifiable (SHA-512 unavailable); prompting instead of "
+                "falling through to grants",
+                c->binary, (int)c->ev->pid);
     return 0;
 }
 
@@ -3495,6 +3557,14 @@ static int try_pinned_allowlist(EventCtx *c)
  */
 static int event_runtime_allowed(EventCtx *c)
 {
+    /* An inconclusive deny (path keys fit, stored digest unverifiable)
+     * gates every grant stage: no hash-free grant -- file cache, session
+     * allow, runtime allow, [unsafe_allowlist] -- may decide while a
+     * denial that may well fit is waiting to be verified.  The caller
+     * reaches the dialog (fail closed). */
+    if (c->deny_inconclusive)
+        return 0;
+
     /*
      * A hard-link/unprotected-path event must not be resolved by a rule
      * scoped to a different path (or by a wildcard grant): force the
@@ -3881,23 +3951,57 @@ unsigned int fanotify_test_record_allow_decision(const char *binary,
 
 /*
  * Advance to the next event in one read(2) batch.  Encapsulates the
- * offset arithmetic and the malformed-length guard: a zero or oversized
- * event_len must end the walk instead of looping or stepping outside the
- * buffer.  Returns NULL when the batch is exhausted (the caller's
- * while (FAN_EVENT_OK(...)) then also fails and exits).
+ * offset arithmetic and the malformed-length guard: an event_len outside
+ * the walk contract ([header, remaining]) makes every record behind this
+ * position unlocatable, so the walk ends instead of looping or stepping
+ * outside the buffer.  Tri-state: returns the next record on advance;
+ * NULL with *malformed == 0 for a clean end (the caller's while
+ * (FAN_EVENT_OK(...)) also fails and exits, silently); NULL with
+ * *malformed == 1 when a record length is invalid — the current record
+ * was already handled by the caller, only the tail is lost, and the
+ * caller logs loudly rather than guessing positions (the stance
+ * batch_abandon documents).  A record returned here always satisfies
+ * FAN_EVENT_OK.
  */
 static const struct fanotify_event_metadata *
-event_next(const struct fanotify_event_metadata *ev, ssize_t *remaining)
+event_next(const struct fanotify_event_metadata *ev, ssize_t *remaining,
+           int *malformed)
 {
-    if (ev->event_len == 0 || (ssize_t)ev->event_len > *remaining)
+    const struct fanotify_event_metadata *next;
+
+    *malformed = 0;
+    if (!FAN_EVENT_OK(ev, (size_t)*remaining))
+    {
+        *malformed = 1;
         return NULL;
+    }
     *remaining -= (ssize_t)ev->event_len;
     /* Less than one header left: no full record (and therefore no
      * duplicated event fd) can hide in the tail, so the walk ends. */
     if (*remaining < (ssize_t)sizeof(struct fanotify_event_metadata))
         return NULL;
-    return (const struct fanotify_event_metadata *)((const char *)ev +
+    next = (const struct fanotify_event_metadata *)((const char *)ev +
                                                     ev->event_len);
+    if (!FAN_EVENT_OK(next, (size_t)*remaining))
+    {
+        *malformed = 1;
+        return NULL;
+    }
+    return next;
+}
+
+/*
+ * Shared loud reaction to event_next()'s malformed flag: a record whose
+ * length is invalid makes the rest of the batch unlocatable, so the tail
+ * is dropped rather than guessed at.  The current record was already
+ * handled; only the remainder is lost.  A clean end stays silent.
+ */
+static void log_batch_tail_lost(ssize_t remaining)
+{
+    log_msg(LOG_ERR,
+            "fanotify batch: malformed record length; the remainder of the "
+            "batch (%zd bytes) is unlocatable and was dropped",
+            remaining);
 }
 
 /* ------------------------------------------------------------------ */
@@ -4072,6 +4176,7 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
         const struct fanotify_event_metadata *ev =
             (const struct fanotify_event_metadata *)buf;
         ssize_t remaining = n;
+        int malformed = 0;
 
         while (FAN_EVENT_OK(ev, (size_t)remaining))
         {
@@ -4105,13 +4210,17 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
             }
             else if (ev->mask & FAN_OPEN_PERM)
             {
-                /* FAN_NOFD (kernel fd-creation failure): there is no event
-                 * fd to close, but the requester's open() must not stay
-                 * kernel-blocked.  Respond and move on, mirroring
-                 * event_resolve() in the main loop (fail closed). */
-                log_msg(LOG_WARNING, "[pump] FAN_NOFD for pid=%d, denying",
+                /* FAN_NOFD (kernel fd-creation failure): unreachable for
+                 * this fd-based group — the kernel already auto-DENIED
+                 * the permission event (fanotify_read: copy_event_to_user
+                 * failure -> finish_permission_event(FAN_DENY)), so this
+                 * branch is pure defense.  There is no event fd to answer
+                 * with: a write with fd=-1 would earn EINVAL, set g_fatal
+                 * and queue a phantom retry.  Log and skip as handled. */
+                log_msg(LOG_WARNING,
+                        "[pump] FAN_NOFD for pid=%d; kernel already denied, "
+                        "skipping respond",
                         (int)ev->pid);
-                fanotify_respond(fan_fd, ev, FAN_DENY);
             }
             else if (ev->mask & (FAN_CREATE | FAN_MOVED_TO))
             {
@@ -4139,10 +4248,12 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
              * batch_abandon() below; nothing is left open or unanswered. */
             if (g_fatal || !g_running || g_need_reload)
                 break;
-            ev = event_next(ev, &remaining);
+            ev = event_next(ev, &remaining, &malformed);
             if (!ev)
                 break;
         }
+        if (malformed)
+            log_batch_tail_lost(remaining);
         if (g_fatal || !g_running || g_need_reload)
         {
             /* Claim the records this walk exited in front of before
@@ -4529,7 +4640,9 @@ static int batch_abandon(int fan_fd,
                          const struct fanotify_event_metadata *ev,
                          ssize_t remaining)
 {
-    const struct fanotify_event_metadata *next = event_next(ev, &remaining);
+    int malformed = 0;
+    const struct fanotify_event_metadata *next =
+        event_next(ev, &remaining, &malformed);
     int denied = 0;
 
     while (next)
@@ -4558,8 +4671,14 @@ static int batch_abandon(int fan_fd,
         {
             close((int)next->fd);
         }
-        next = event_next(next, &remaining);
+        next = event_next(next, &remaining, &malformed);
     }
+
+    if (malformed)
+        log_msg(LOG_ERR,
+                "abandoned fanotify batch: malformed record length; "
+                "the rest of the batch (%zd bytes) cannot be claimed",
+                remaining);
 
     if (denied > 0)
         log_msg(LOG_WARNING,
@@ -4661,6 +4780,7 @@ void fanotify_drain_and_deny(int fan_fd)
         const struct fanotify_event_metadata *ev =
             (const struct fanotify_event_metadata *)buf;
         ssize_t remaining = n;
+        int malformed = 0;
 
         while (FAN_EVENT_OK(ev, (size_t)remaining))
         {
@@ -4682,10 +4802,12 @@ void fanotify_drain_and_deny(int fan_fd)
                 close((int)ev->fd);
             }
 
-            ev = event_next(ev, &remaining);
+            ev = event_next(ev, &remaining, &malformed);
             if (!ev)
                 break;
         }
+        if (malformed)
+            log_batch_tail_lost(remaining);
     }
 
     if (denied > 0)
@@ -4878,6 +5000,7 @@ void fanotify_loop(int fd, int wake_fd, int control_fd)
         ev = (const struct fanotify_event_metadata *)buf;
         {
             ssize_t remaining = n;
+            int malformed = 0;
 
             while (FAN_EVENT_OK(ev, (size_t)remaining))
             {
@@ -4939,10 +5062,12 @@ void fanotify_loop(int fd, int wake_fd, int control_fd)
                     batch_abandon(fd, ev, remaining);
                     break;
                 }
-                ev = event_next(ev, &remaining);
+                ev = event_next(ev, &remaining, &malformed);
                 if (!ev)
                     break;
             }
+            if (malformed)
+                log_batch_tail_lost(remaining);
         }
 
         if (!g_running || g_need_reload || g_fatal)
@@ -5276,6 +5401,46 @@ int fanotify_test_batch_abandon(int group_fd,
 }
 
 /*
+ * Test seam (fanotify.h): event_next()'s tri-state.  Returns the next
+ * batch record or NULL; *malformed is 1 only when an invalid event_len
+ * makes the rest of the batch unlocatable, 0 for a clean end.
+ */
+const struct fanotify_event_metadata *
+fanotify_test_event_next(const struct fanotify_event_metadata *ev,
+                         ssize_t *remaining, int *malformed)
+{
+    return event_next(ev, remaining, malformed);
+}
+
+/*
+ * Test seam (fanotify.h): event_resolve()'s FAN_NOFD branch.  Runs the
+ * real stage-1 check on a synthetic context whose event fd is FAN_NOFD
+ * and returns its verdict (1 = handled).  group_fd (a pipe write end
+ * stands in for the group) must receive NO fanotify_response bytes:
+ * there is no event fd to answer, the kernel already denied the event,
+ * and a write with fd=-1 would earn EINVAL -> g_fatal -> a phantom retry.
+ */
+int fanotify_test_resolve_nofd(int group_fd)
+{
+    struct fanotify_event_metadata ev;
+    EventCtx c;
+
+    memset(&ev, 0, sizeof(ev));
+    ev.event_len = sizeof(ev);
+    ev.vers = FANOTIFY_METADATA_VERSION;
+    ev.metadata_len = sizeof(ev);
+    ev.mask = FAN_OPEN_PERM;
+    ev.fd = FAN_NOFD;
+    ev.pid = (int)getpid();
+
+    memset(&c, 0, sizeof(c));
+    c.fan_fd = group_fd;
+    c.ev = &ev;
+    c.fd_num = FAN_NOFD;
+    return event_resolve(&c);
+}
+
+/*
  * Test seams (fanotify.h): the failed-response retry queue.
  * fanotify_test_respond() runs the real fanotify_respond() so the
  * queue-growth, stranded-fallback and return contract can be driven with
@@ -5409,4 +5574,24 @@ int fanotify_test_pin_first_seen(const char *binary, const char *bin_sha512,
         return -1;
     }
     return config_allow_pin_first_seen(rule, bin_sha512);
+}
+
+/*
+ * Test seam (fanotify.h): fanotify_pump() with g_pump_in_pipeline forced
+ * to the state hash_wait_pump creates while a hash helper waits inside a
+ * defer-mode decision.  Saves and restores the flag exactly like the
+ * guard's set/clear pair around process_open_perm, so the nested branch
+ * (cheap fast-path allow / defer — never a recursive pipeline run) is
+ * reachable from a test without a live hash wait.  Returns the pump's
+ * responded-event count.
+ */
+int fanotify_test_pump_nested(int fan_fd, pid_t dialog_pid)
+{
+    int saved = g_pump_in_pipeline;
+    int responded;
+
+    g_pump_in_pipeline = 1;
+    responded = fanotify_pump(fan_fd, dialog_pid);
+    g_pump_in_pipeline = saved;
+    return responded;
 }

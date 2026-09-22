@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -433,6 +434,64 @@ static void test_read_cmdline_multi_argv(void) {
     waitpid(child, NULL, 0);
 }
 
+/*
+ * Item 6 regression: close_fds_from must close every fd >= 'first' in the
+ * calling process (the leak fence so no daemon descriptor reaches a forked
+ * helper) while fds below 'first' survive.  Run in a forked child so the
+ * parent's descriptors are never touched; the observable contract is
+ * identical for the close_range(2) fast path and the bounded fallback
+ * loop, so one test covers both.  first=3 keeps stdin/out/err open, so the
+ * child can safely report via exit status alone.  Child exit codes:
+ * 16 = could not open high fds, 32 = pre-check failed, bits 1/2/4 = the
+ * individual post-call assertions.
+ */
+static void test_close_fds_from(void) {
+    pid_t child = fork();
+    if (child < 0) {
+        fprintf(stderr, "SKIP: fork unavailable; close_fds_from test skipped\n");
+        return;
+    }
+    if (child == 0) {
+        int hi1 = open("/dev/null", O_RDONLY);
+        int hi2 = open("/dev/null", O_RDONLY);
+        if (hi1 < 3 || hi2 < 3)
+            _exit(16); /* could not obtain fds >= 3 */
+        /* Both high fds must be live before the call, or the check is vacuous. */
+        if (fcntl(hi1, F_GETFD) == -1 || fcntl(hi2, F_GETFD) == -1)
+            _exit(32);
+
+        close_fds_from(3);
+
+        int status = 0;
+        /* fds below 'first' survive: stdio stays valid (first=3). */
+        if (fcntl(0, F_GETFD) == -1 || fcntl(1, F_GETFD) == -1 ||
+            fcntl(2, F_GETFD) == -1)
+            status |= 1;
+        errno = 0;
+        if (!(fcntl(hi1, F_GETFD) == -1 && errno == EBADF))
+            status |= 2;
+        errno = 0;
+        if (!(fcntl(hi2, F_GETFD) == -1 && errno == EBADF))
+            status |= 4;
+        _exit(status);
+    }
+
+    int wstatus = 0;
+    ASSERT(waitpid(child, &wstatus, 0) == child, "waitpid close_fds_from child");
+    if (!WIFEXITED(wstatus)) {
+        ASSERT(0, "close_fds_from child exited normally");
+        return;
+    }
+    int code = WEXITSTATUS(wstatus);
+    ASSERT(code != 16, "child opened fds >= 3");
+    ASSERT(code != 32, "high fds live before close_fds_from(3)");
+    if (code != 16 && code != 32) {
+        ASSERT(!(code & 1), "fds below first survive close_fds_from(3)");
+        ASSERT(!(code & 2), "first high fd closed by close_fds_from(3)");
+        ASSERT(!(code & 4), "second high fd closed by close_fds_from(3)");
+    }
+}
+
 int main(void) {
     printf("=== test_utils ===\n");
     test_path_under();
@@ -446,6 +505,7 @@ int main(void) {
     test_log_scrub();
     test_parse_proc_stat();
     test_read_cmdline_multi_argv();
+    test_close_fds_from();
     if (failures) {
         fprintf(stderr, "%d test(s) failed\n", failures);
         return 1;

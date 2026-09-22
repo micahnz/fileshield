@@ -4,6 +4,7 @@
 #include <sys/types.h>
 #include <stddef.h>
 #include <limits.h>
+#include <stdio.h>
 
 #define PERSIST_MAX_ENTRIES 256
 #define PERSIST_CHAIN_MAX 3
@@ -76,6 +77,19 @@ int persist_json_escape(const char *src, char *dst, size_t dst_size);
  */
 int persist_json_extract_string(const char *line, char *key_out, size_t keysz,
                                 char *out, size_t outsz);
+
+/*
+ * Root-run trust bar shared by the state loaders.  When geteuid()==0,
+ * refuse a path that is itself a symlink (lstat), or a regular file that
+ * is not root-owned or is group/other-writable (fstat of the already
+ * opened fp) -- the same bar as config_load().  Non-regular sources are
+ * left to the parser, and non-root runs always pass (tests and the CLI
+ * fallback stay unaffected).  Returns 0 when trusted, -1 when refused,
+ * logging why under the caller tag 'what' (e.g. "persist_load").
+ * Callers handle ENOENT before opening: this runs only after a
+ * successful fopen.
+ */
+int persist_file_trusted(FILE *fp, const char *filepath, const char *what);
 
 /*
  * Atomically write text (a NUL-terminated string, written without its

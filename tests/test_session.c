@@ -205,6 +205,8 @@ static void test_empty_digest_matches_for_session(void)
     session_deny_add(sid, start, bin, "", target, 0);
     ASSERT(session_deny_match(sid, bin, "cccccccccccccccc", target) == 1,
            "a digest-less deny entry also matches (conservative)");
+    ASSERT(session_deny_match(sid, bin, "", target) == 1,
+           "a digest-less deny entry matches even with no requester digest");
 
     /* Control: a recorded digest must still match exactly. */
     session_clear();
@@ -344,8 +346,15 @@ static void test_deny(void)
            "deny match on exact key");
     ASSERT(session_deny_match(sid, bin, hash, "/home/u/other") == 0,
            "deny does not match another target");
-    ASSERT(session_deny_match(sid, bin, "", target) == 0,
-           "hash-protected deny cannot be verified without hash");
+    /* Tri-state deny: path keys fit, the entry pins a digest, and the
+     * requester has none -- the deny cannot be verified either way, so
+     * the matcher reports INCONCLUSIVE (-1); the pipeline then skips
+     * grants and prompts instead of denying outright or falling through
+     * to a hash-free grant. */
+    ASSERT(session_deny_match(sid, bin, "", target) == -1,
+           "hash-protected deny with no current hash is inconclusive");
+    ASSERT(session_deny_match(sid, bin, "", "/home/u/other") == 0,
+           "hash failure alone (no path match) is never inconclusive");
     ASSERT(session_deny_match(sid, bin, "0000000000000000", target) == 0,
            "deny match with wrong hash");
 

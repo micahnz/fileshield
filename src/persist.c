@@ -82,6 +82,53 @@ static int ensure_parent_dir(const char *filepath)
 }
 
 /*
+ * Shared root-run trust bar for state-file loads (persist.h): a state
+ * file another user can modify is a privilege-escalation path (a planted
+ * allow/deny rule or hash pin), so it is refused rather than warned
+ * about -- the same bar as config_load().  The ownership/mode check
+ * covers regular files only (fstat of the opened fd, exactly like
+ * config_load(); a non-regular source such as a fifo or device skips it
+ * and reaches the parser), while a path that is itself a symlink is
+ * refused outright: the daemon's own writer never creates one.  Runs
+ * only under geteuid()==0 so unprivileged test runs are unaffected.
+ */
+int persist_file_trusted(FILE *fp, const char *filepath, const char *what)
+{
+    struct stat st;
+    int unsafe = 0;
+
+    if (geteuid() != 0)
+        return 0;
+
+    if (lstat(filepath, &st) == 0 && S_ISLNK(st.st_mode))
+    {
+        log_msg(LOG_ERR, "%s: %s is a symlink; refusing to load it", what,
+                filepath);
+        unsafe = 1;
+    }
+    if (fstat(fileno(fp), &st) == 0 && S_ISREG(st.st_mode))
+    {
+        if (st.st_uid != 0)
+        {
+            log_msg(LOG_ERR, "%s: %s is not owned by root", what, filepath);
+            unsafe = 1;
+        }
+        if (st.st_mode & 022)
+        {
+            log_msg(LOG_ERR, "%s: %s is writable by group/other", what,
+                    filepath);
+            unsafe = 1;
+        }
+    }
+    if (unsafe)
+        log_msg(LOG_ERR,
+                "%s: refusing a state file another user can modify; fix the "
+                "ownership/permissions and reload",
+                what);
+    return unsafe ? -1 : 0;
+}
+
+/*
  * Create '<filepath>.tmp.<pid>' exclusively at 0600 with O_NOFOLLOW, so a
  * planted symlink is never followed and the file is never readable by
  * others.  A stale temp file from a crash (EEXIST) is removed and the
@@ -682,10 +729,12 @@ static int apply_rule_id(const char *filepath, PersistEntry *e,
  * Damage is layered by what it can affect:
  *
  *   - file-damaging (returns -1; the caller clears the in-memory
- *     lists): open/read errors, a line longer than JSON_LINE_MAX
- *     (which the writer can never emit), and structural incompleteness
- *     (no "entries" array, a missing ] or }, an entry cut off
- *     mid-way).  A partial or foreign file must never load as state.
+ *     lists): open/read errors (including a root-run ownership,
+ *     permission or symlink refusal of the file itself), a line longer
+ *     than JSON_LINE_MAX (which the writer can never emit), and
+ *     structural incompleteness (no "entries" array, a missing ] or },
+ *     an entry cut off mid-way).  A partial or foreign file must never
+ *     load as state.
  *   - entry-damaging (dropped at that entry's '}', the file still
  *     loads): a present-but-malformed rule_id, or a string value on a
  *     known numeric field -- admitting either would silently weaken a
@@ -746,6 +795,18 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
         log_msg(LOG_ERR, "persist_load: open %s: %s", filepath,
                 strerror(errno));
         return -1;
+    }
+
+    /*
+     * Root-run trust bar (persist_file_trusted): a state file another
+     * user can modify is a privilege-escalation path (a planted
+     * allow/deny rule); refusal is fail-secure -- the caller clears the
+     * list.  ENOENT above is untouched and still means an empty table.
+     */
+    if (persist_file_trusted(fp, filepath, "persist_load") < 0)
+    {
+        fclose(fp);
+        return -1; /* fail secure: the caller clears the list */
     }
 
     /* Scan to EOF even past the entry cap so truncation is detected and

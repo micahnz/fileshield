@@ -969,6 +969,33 @@ int config_load(const char *path, Config *cfg)
     {
         if (!strchr(line, '\n') && !feof(fp))
         {
+            /* The line overflowed the PATH_MAX*2 buffer: only its prefix
+             * is available, so the comment/blank decision is made on the
+             * first non-whitespace byte of that prefix. */
+            const char *lp = line;
+            while (*lp == ' ' || *lp == '\t')
+                lp++;
+            if (*lp != '\0' && *lp != '#' &&
+                (section == SECTION_PROTECTED ||
+                 section == SECTION_ALLOWLIST ||
+                 section == SECTION_UNSAFE_ALLOWLIST ||
+                 section == SECTION_DENYLIST || *lp == '['))
+            {
+                /* A non-comment entry in a rule section that no longer
+                 * fits the parse buffer must refuse the whole config,
+                 * like the MAX_PATHS/MAX_RULES cap cases: skipping it
+                 * would silently drop the rule (or an entire section
+                 * behind a header we never see), breaking the promise
+                 * that a typo cannot silently drop rules.  Comments,
+                 * blanks, [settings] lines and preamble garbage drop no
+                 * rules, so they keep the historical skip-with-log. */
+                log_msg(LOG_ERR,
+                        "config_load: over-long rule/section line; "
+                        "refusing the config instead of silently dropping "
+                        "it");
+                fclose(fp);
+                return -1;
+            }
             log_msg(LOG_ERR, "config_load: line too long, skipping");
             int c;
             while ((c = fgetc(fp)) != '\n' && c != EOF)

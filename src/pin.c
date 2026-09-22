@@ -526,6 +526,22 @@ int pin_load_file(const char *filepath, PinRecord *out, int max,
         return -1;
     }
 
+    /*
+     * Same trust bar as config_load() and persist_load()
+     * (persist_file_trusted, root-run only): a pin file another user can
+     * modify could silently re-pin a binary (the grant channel), so the
+     * load is refused -- at least as strict as an fopen failure:
+     * damaged_out=1, never an empty/TOFU table.  The ENOENT branch above
+     * is untouched and still means TOFU.
+     */
+    if (persist_file_trusted(fp, filepath, "pin_load_file") < 0)
+    {
+        fclose(fp);
+        if (damaged_out)
+            *damaged_out = 1;
+        return -1;
+    }
+
     count = pin_read_entries(fp, filepath, out, max);
     fclose(fp);
 

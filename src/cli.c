@@ -40,9 +40,30 @@
 #define CLI_RESP_MAX (CLI_SESSION_MAX * (6 * 2 * PATH_MAX + 512))
 
 static int g_yes;  /* -y/--yes: skip confirmations */
-static int g_wide; /* --wide: no binary/args/target truncation */ 
+static int g_wide; /* --wide: no binary/args/target truncation */
 static int g_dry;  /* -n/--dry-run: prune lists only */
 static int g_json; /* --json: machine-readable list/describe */
+
+#ifdef FILESHIELD_TEST_CLI
+/* Test-only state-file redirect (cli_test_set_state_files): both paths
+ * must be set together so rule_path() never mixes a temp allow file with
+ * the real deny file.  Production builds strip this block entirely. */
+static char g_test_allow_path[PATH_MAX];
+static char g_test_deny_path[PATH_MAX];
+
+void cli_test_set_state_files(const char *allow, const char *deny)
+{
+    g_test_allow_path[0] = '\0';
+    g_test_deny_path[0] = '\0';
+    if (!allow || allow[0] == '\0' || !deny || deny[0] == '\0')
+        return;
+    if (strlen(allow) >= sizeof(g_test_allow_path) ||
+        strlen(deny) >= sizeof(g_test_deny_path))
+        return;
+    memcpy(g_test_allow_path, allow, strlen(allow) + 1);
+    memcpy(g_test_deny_path, deny, strlen(deny) + 1);
+}
+#endif /* FILESHIELD_TEST_CLI */
 
 /* Allocated on first socket use so read-only commands never pay for it. */
 static char *g_resp_buf;
@@ -146,6 +167,12 @@ static int report_resolve(const char *kind, const char *input, int rc)
 
 static const char *rule_path(int deny)
 {
+#ifdef FILESHIELD_TEST_CLI
+    /* Test-only redirect so suite cases open a temp file, never
+     * /var/lib/fileshield.  NULL/empty on either side clears both. */
+    if (g_test_allow_path[0] != '\0' && g_test_deny_path[0] != '\0')
+        return deny ? g_test_deny_path : g_test_allow_path;
+#endif
     return deny ? PERSIST_DENY_STATE_FILE : PERSIST_STATE_FILE;
 }
 
@@ -1084,24 +1111,34 @@ static int clear_rules(int deny)
 
     if (load_entries(deny, &entries, &count) < 0)
         return 1;
-    if (count == 0)
+    if (count > 0)
     {
-        printf("no %s rules to clear\n", rule_label(deny));
-        free(entries);
-        return 0;
+        printf("This clears all %d %s rule(s).\n", count, rule_label(deny));
+        if (!cli_confirm("Clear the list?", g_yes))
+        {
+            printf("aborted; nothing cleared\n");
+            free(entries);
+            return 1;
+        }
     }
-    printf("This clears all %d %s rule(s).\n", count, rule_label(deny));
-    if (!cli_confirm("Clear the list?", g_yes))
-    {
-        printf("aborted; nothing cleared\n");
-        free(entries);
-        return 1;
-    }
-
+    /*
+     * The file snapshot drives the prompt above, never the socket: a live
+     * daemon can hold entries whose persist_save() failed earlier, so a
+     * clear is sent whenever a listener answers -- even when the file was
+     * empty (then no prompt: there is nothing there to confirm).  The
+     * daemon's count is authoritative; the file-only path below runs only
+     * when no listener answers (ENOENT/ECONNREFUSED).
+     */
     int rc = ctl_call(deny ? "RULE_CLEAR\tdeny" : "RULE_CLEAR\tallow",
                       &(ControlResponse){0});
     if (rc == 1)
     {
+        if (count == 0)
+        {
+            printf("no %s rules to clear\n", rule_label(deny));
+            free(entries);
+            return 0;
+        }
         if (persist_save(rule_path(deny), entries, 0) < 0)
         {
             fprintf(stderr, "error: failed to write %s\n", rule_path(deny));
@@ -1111,7 +1148,6 @@ static int clear_rules(int deny)
         fprintf(stderr, "warning: daemon not running; applied directly to %s "
                         "(start fileshield to enforce)\n", rule_path(deny));
         rc = 0;
-        count = 0;
     }
     free(entries);
     if (rc < 0)
@@ -1401,19 +1437,24 @@ static int cmd_prune(const char *which)
             return 1;
         total_groups += g;
     }
-    if (total_groups == 0)
-    {
-        /* Nothing matched: no prompt, no socket round trip. */
-        printf("there are no results to prune\n");
-        return 0;
-    }
-
+    /* Dry run never touches the socket; with no groups it keeps the
+     * documented "no results" message instead of "dry run". */
     if (g_dry)
     {
-        printf("dry run: nothing removed\n");
+        if (total_groups == 0)
+            printf("there are no results to prune\n");
+        else
+            printf("dry run: nothing removed\n");
         return 0;
     }
-    if (!cli_confirm("Prune these duplicates?", g_yes))
+    /*
+     * The file snapshot drives the prompt -- and is skipped when it shows
+     * nothing to confirm -- but it never gates the socket: a live daemon
+     * can hold ghost duplicates an empty file never showed (see the
+     * divergence note above), so PRUNE is still sent below whenever a
+     * listener answers.  The daemon's removed count is authoritative.
+     */
+    if (total_groups > 0 && !cli_confirm("Prune these duplicates?", g_yes))
     {
         printf("aborted; nothing removed\n");
         return 1;
@@ -1433,6 +1474,14 @@ static int cmd_prune(const char *which)
     rc = ctl_call(request, &resp);
     if (rc == 1)
     {
+        /* No listener (ENOENT/ECONNREFUSED): the file-only path.  An
+         * empty file snapshot had nothing to prune, and the daemon that
+         * might hold ghosts is unreachable now. */
+        if (total_groups == 0)
+        {
+            printf("there are no results to prune\n");
+            return 0;
+        }
         int total = 0;
 
         if (want_allow)
@@ -2060,7 +2109,15 @@ static int cmd_reload(void)
 /*  main                                                               */
 /* ------------------------------------------------------------------ */
 
+/*
+ * FILESHIELD_TEST_CLI renames main to cli_test_main for the test build;
+ * production omits the flag and keeps main (tests: one call per process).
+ */
+#ifdef FILESHIELD_TEST_CLI
+int cli_test_main(int argc, char *argv[])
+#else
 int main(int argc, char *argv[])
+#endif
 {
     g_prog = argv[0];
     static struct option long_opts[] = {

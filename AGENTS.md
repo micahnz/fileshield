@@ -45,6 +45,7 @@ Fileshield/
     ├── test_fanotify.c          # mark mask, deferred queue, state loading, IDs, mutations
     ├── test_ruleid.c            # rule ID canonicalization, nonces, prefix lookup
     ├── test_prune.c             # duplicate grouping and removal compaction
+    ├── test_cli.c               # fileshield-cli: fallback gate, exit codes, confirmation, daemon contact
     ├── test_cli_ui.c            # table/describe/JSON rendering, truncation, confirmation
     ├── test_control.c           # control protocol codec, request parsing, dispatch, socket lifecycle
     ├── test_utils.c             # unit tests for utility functions
@@ -204,6 +205,7 @@ it never hashes a binary and never opens a path.
 - **`test_fanotify`**: mark mask, deferred queue fail-closed flush, daemon queue-overflow flush, incomplete state entries dropped, command-line scoping, full-cmdline fingerprints, rule glob matching, unsafe-first ordering, pin verdicts, first-seen TOFU, damaged-pin fall-through, `created_at` preservation, legacy ID migration, remove/clear/prune mutations with write-failure restore, kernel queue saturation (root)
 - **`test_ruleid`**: canonical identity determinism, field boundaries, chain depth, collision nonces, pin IDs, prefix matching and lookups
 - **`test_prune`**: group detection (interleaved, key-field separation, hash fields not part of the key), malformed-entry exclusion, chain-depth boundary, capacity errors, apply validation and compaction
+- **`test_cli`**: fallback gate (only ENOENT/ECONNREFUSED reach the file path; EACCES never does), exit-code contract 0/1/2, non-tty confirmation without `-y`, clear/prune contacting a reachable daemon even when the state file shows zero entries (errno-injection + temp-socket seams; never touches `/run` or `/var/lib`)
 - **`test_cli_ui`**: sanitize/tail truncation, ARG/CHAIN cells, rule/pin/session tables, totals footer, describe, JSON output, confirmation policy
 - **`test_control`**: field codec, request/response parsing, PING/RELOAD, bad and slow clients, rule/session/pin dispatch, setup/teardown (parent-directory creation, rebound-socket identity), accept handling, client call
 - **`test_utils`**: `proc_exe_path`, `/proc` readers, home expansion, `path_under`

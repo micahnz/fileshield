@@ -338,6 +338,10 @@ static int write_raw_file(const char *path, const char *content)
         return -1;
     fputs(content, fp);
     fclose(fp);
+    /* 0600: a root-run persist_load() refuses group/other-writable
+     * files, so raw fixtures must not depend on the ambient umask. */
+    if (chmod(path, 0600) != 0)
+        return -1;
     return 0;
 }
 
@@ -1403,6 +1407,108 @@ static int test_persist_all_rule_ids_invalid(void)
 }
 
 /* ------------------------------------------------------------------ */
+/*  test: root refuses unsafe state-file loads (M3 trust bar);         */
+/*        ENOENT still means an empty table everywhere                 */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Regression for the config_load() trust bar mirrored into persist_load():
+ * as root the loader refuses a state file that is group/other-writable,
+ * not root-owned, or reached via a symlink -- each refusal is the same
+ * fail-secure -1 as an open error (the caller clears the in-memory list),
+ * never a silent empty/partial load.  The ownership guard runs only under
+ * geteuid()==0, so unprivileged runs load the very same file cleanly;
+ * those root-only cases SKIP when unprivileged.  ENOENT keeps meaning
+ * "empty table" for every euid.
+ */
+static int test_persist_load_unsafe_refused(void)
+{
+    char path[PATH_MAX];
+    char victim[PATH_MAX];
+    PersistEntry out[PERSIST_MAX_ENTRIES];
+    const char *content =
+        "{\n  \"entries\": [\n    {\n"
+        "      \"rule_id\": \"0123456789abcdef\",\n"
+        "      \"binary\": \"/usr/bin/unsafe\",\n"
+        "      \"chain_depth\": 0,\n"
+        "      \"created_at\": 1\n"
+        "    }\n  ]\n}\n";
+
+    /* ENOENT: a missing file is an empty table (0), not an error --
+     * asserted for every euid, before any root-only case. */
+    make_test_path(path, sizeof(path), "unsafe_missing.json");
+    unlink(path);
+    ASSERT(persist_load(path, out, PERSIST_MAX_ENTRIES) == 0,
+           "missing file still returns 0 (ENOENT preserved)");
+
+    /* Group/other-writable file: refused as root, loaded unchanged when
+     * unprivileged (the trust bar is root-only). */
+    make_test_path(path, sizeof(path), "unsafe_mode.json");
+    unlink(path);
+    ASSERT(write_raw_file(path, content) == 0, "write state file");
+    ASSERT(chmod(path, 0666) == 0, "chmod 0666 the state file");
+    if (geteuid() == 0)
+    {
+        ASSERT(persist_load(path, out, PERSIST_MAX_ENTRIES) == -1,
+               "root refuses a group/other-writable state file");
+    }
+    else
+    {
+        ASSERT(persist_load(path, out, PERSIST_MAX_ENTRIES) == 1,
+               "unprivileged load is unaffected by the root-only bar");
+        ASSERT(strcmp(out[0].binary, "/usr/bin/unsafe") == 0,
+               "unprivileged load parses the file normally");
+    }
+    unlink(path);
+
+    if (geteuid() != 0)
+    {
+        printf("SKIP: symlink/foreign-owner state-file refusal needs root\n");
+        TEST_PASS("state-file trust bar (root-only) + ENOENT preserved");
+        return 0;
+    }
+
+    /* A symlink at the state path: refused even though the target is a
+     * perfectly trustworthy root-owned 0600 file. */
+    make_test_path(victim, sizeof(victim), "unsafe_symlink_victim");
+    make_test_path(path, sizeof(path), "unsafe_symlink.json");
+    unlink(path);
+    unlink(victim);
+    ASSERT(write_raw_file(victim, content) == 0, "write symlink victim");
+    ASSERT(symlink(victim, path) == 0, "plant symlink at the state path");
+    ASSERT(persist_load(path, out, PERSIST_MAX_ENTRIES) == -1,
+           "root refuses a symlinked state file");
+    ASSERT(access(victim, F_OK) == 0, "symlink victim left in place");
+    unlink(path);
+
+    /* A foreign-owned state file: refused (chown needs root, so this
+     * case only exists in the root branch). */
+    make_test_path(path, sizeof(path), "unsafe_owner.json");
+    unlink(path);
+    ASSERT(write_raw_file(path, content) == 0, "write state file");
+    ASSERT(chown(path, 1, 1) == 0, "chown the state file to uid 1");
+    ASSERT(persist_load(path, out, PERSIST_MAX_ENTRIES) == -1,
+           "root refuses a non-root-owned state file");
+    unlink(path);
+
+    /* Control: a root-owned 0600 file still loads -- the bar is not
+     * over-broad. */
+    make_test_path(path, sizeof(path), "unsafe_control.json");
+    unlink(path);
+    ASSERT(write_raw_file(path, content) == 0, "write control state file");
+    ASSERT(chmod(path, 0600) == 0, "chmod 0600 the control file");
+    ASSERT(persist_load(path, out, PERSIST_MAX_ENTRIES) == 1,
+           "root-owned 0600 state file still loads");
+    ASSERT(strcmp(out[0].binary, "/usr/bin/unsafe") == 0,
+           "control load parses the entry");
+
+    unlink(path);
+    unlink(victim);
+    TEST_PASS("root refuses unsafe state-file loads; ENOENT preserved");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  main                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -1449,6 +1555,7 @@ int main(void)
     failed |= test_persist_legacy_without_rule_id();
     failed |= test_persist_invalid_rule_id_rejected();
     failed |= test_persist_all_rule_ids_invalid();
+    failed |= test_persist_load_unsafe_refused();
 
     rmdir(g_test_dir);
 
