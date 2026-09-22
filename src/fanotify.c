@@ -5575,3 +5575,23 @@ int fanotify_test_pin_first_seen(const char *binary, const char *bin_sha512,
     }
     return config_allow_pin_first_seen(rule, bin_sha512);
 }
+
+/*
+ * Test seam (fanotify.h): fanotify_pump() with g_pump_in_pipeline forced
+ * to the state hash_wait_pump creates while a hash helper waits inside a
+ * defer-mode decision.  Saves and restores the flag exactly like the
+ * guard's set/clear pair around process_open_perm, so the nested branch
+ * (cheap fast-path allow / defer — never a recursive pipeline run) is
+ * reachable from a test without a live hash wait.  Returns the pump's
+ * responded-event count.
+ */
+int fanotify_test_pump_nested(int fan_fd, pid_t dialog_pid)
+{
+    int saved = g_pump_in_pipeline;
+    int responded;
+
+    g_pump_in_pipeline = 1;
+    responded = fanotify_pump(fan_fd, dialog_pid);
+    g_pump_in_pipeline = saved;
+    return responded;
+}

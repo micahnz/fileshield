@@ -4081,6 +4081,175 @@ static void test_pump_defer_contract(void) {
 }
 
 /*
+ * Part 0h5: pump re-entrancy (g_pump_in_pipeline).  While a defer-mode
+ * pipeline decision is hashing, sha512's wait hook re-enters the pump;
+ * the nested call must take the cheap branch and never recurse into
+ * process_open_perm.  Socketpair fake group; one synthetic FAN_OPEN_PERM
+ * whose target is outside every protected prefix (mount-mark noise shape)
+ * with an untracked inode — in the full pipeline that classifies as a
+ * hard-link-style event, skips every grant, reaches the ask stage and
+ * DEFERs (no response written); under the forced flag the nested branch
+ * takes the cheap fast-path ALLOW instead.  A regression that lets the
+ * nested path re-enter the full pipeline makes the nested run defer like
+ * the control and fails the ALLOW assertion.  The control case only
+ * reaches the ask stage while no mount marks are installed (with marks
+ * the full pipeline's own fast path would allow unprotected noise first);
+ * fanotify_any_mark_active() pins that precondition.
+ */
+static void test_pump_nested_skips_pipeline(void) {
+    static Config cfg;
+    Config *saved = g_config;
+    char dir[] = "/tmp/fileshield_pumpnest_XXXXXX";
+    char path[PATH_MAX];
+    int sv[2] = { -1, -1 };
+    int discard[2] = { -1, -1 };
+    int efd = -1;
+
+    log_msg(LOG_DEBUG, "warm up syslog before nested-pump socketpair");
+
+    ASSERT(fanotify_any_mark_active() == 0,
+           "no mount-mark fast-path state before the nested-pump test");
+    session_clear();
+    fanotify_test_recent_clear();
+    inode_set_clear();
+
+    /* One protected path that cannot cover the temp target below: the
+     * event must stay outside every protected prefix so the full
+     * pipeline reaches the ask stage while the nested branch takes the
+     * cheap allow. */
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.protected[0].path, sizeof(cfg.protected[0].path),
+             "/home/u/secret");
+    cfg.protected[0].base_len = (int)strlen(cfg.protected[0].path);
+    cfg.protected_count = 1;
+    g_config = &cfg;
+
+    if (mkdtemp(dir) == NULL)
+    {
+        ASSERT(0, "mkdtemp for nested-pump target");
+        g_config = saved;
+        return;
+    }
+    snprintf(path, sizeof(path), "%s/target", dir);
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
+    {
+        ASSERT(0, "socketpair as fake fanotify group");
+        unlink(path);
+        rmdir(dir);
+        g_config = saved;
+        return;
+    }
+    int fl = fcntl(sv[0], F_GETFL, 0);
+    ASSERT(fl >= 0 && fcntl(sv[0], F_SETFL, fl | O_NONBLOCK) == 0,
+           "make the fake group non-blocking like FAN_NONBLOCK");
+    fl = fcntl(sv[1], F_GETFL, 0);
+    ASSERT(fl >= 0 && fcntl(sv[1], F_SETFL, fl | O_NONBLOCK) == 0,
+           "non-blocking response side: a missing answer must not hang");
+    if (pipe(discard) != 0)
+    {
+        ASSERT(0, "discard pipe for the deferred flush");
+        close(sv[0]);
+        close(sv[1]);
+        unlink(path);
+        rmdir(dir);
+        g_config = saved;
+        return;
+    }
+
+    /* Control: the same event through a normal fanotify_pump.  The full
+     * pipeline classifies the unprotected path, skips grants, reaches the
+     * ask stage and defers — no immediate response, pump returns 0. */
+    efd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    ASSERT(efd >= 0, "open control event fd");
+    if (efd >= 0)
+    {
+        static char rec[sizeof(struct fanotify_event_metadata)]
+            __attribute__((aligned(__alignof__(struct fanotify_event_metadata))));
+        struct fanotify_event_metadata *md =
+            (struct fanotify_event_metadata *)rec;
+        memset(rec, 0, sizeof(rec));
+        md->event_len = sizeof(*md);
+        md->metadata_len = sizeof(*md);
+        md->vers = FANOTIFY_METADATA_VERSION;
+        md->mask = FAN_OPEN_PERM;
+        md->fd = efd;
+        md->pid = (int)getpid();
+
+        ASSERT(write(sv[1], rec, sizeof(*md)) == (ssize_t)sizeof(*md),
+               "feed one control FAN_OPEN_PERM event");
+        int r = fanotify_pump(sv[0], 0);
+        ASSERT(r == 0,
+               "control: unprotected event reaches ask and defers (no response)");
+        ASSERT(fcntl(efd, F_GETFD) >= 0,
+               "control: deferred event fd stays open for the main loop");
+        ASSERT(fanotify_test_unanswered_count() == 0 &&
+                   fanotify_test_stranded_count() == 0,
+               "control: defer queues no retry");
+
+        struct fanotify_response resp;
+        ssize_t got = read(sv[1], &resp, sizeof(resp));
+        ASSERT(got < 0 && errno == EAGAIN,
+               "control: no immediate response written (defer mode)");
+
+        /* Fail-closed cleanup: deny+close the deferred event so the
+         * pending queue is empty for the nested run and later tests. */
+        fanotify_flush_pending(discard[1]);
+        ASSERT(fcntl(efd, F_GETFD) == -1 && errno == EBADF,
+               "control: flush denies and closes the deferred event fd");
+    }
+
+    /* Nested: the same event shape with g_pump_in_pipeline forced (the
+     * state hash_wait_pump creates).  The cheap branch allows — FAN_ALLOW
+     * written, event fd closed, pump returns 1 — and never enters the
+     * full decision pipeline (which would have deferred this event). */
+    efd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    ASSERT(efd >= 0, "open nested event fd");
+    if (efd >= 0)
+    {
+        static char rec2[sizeof(struct fanotify_event_metadata)]
+            __attribute__((aligned(__alignof__(struct fanotify_event_metadata))));
+        struct fanotify_event_metadata *md =
+            (struct fanotify_event_metadata *)rec2;
+        memset(rec2, 0, sizeof(rec2));
+        md->event_len = sizeof(*md);
+        md->metadata_len = sizeof(*md);
+        md->vers = FANOTIFY_METADATA_VERSION;
+        md->mask = FAN_OPEN_PERM;
+        md->fd = efd;
+        md->pid = (int)getpid();
+
+        ASSERT(write(sv[1], rec2, sizeof(*md)) == (ssize_t)sizeof(*md),
+               "feed one nested FAN_OPEN_PERM event");
+        int r = fanotify_test_pump_nested(sv[0], 0);
+        ASSERT(r == 1,
+               "nested: cheap fast-path allow decides (no pipeline recursion)");
+        ASSERT(fcntl(efd, F_GETFD) == -1 && errno == EBADF,
+               "nested: event fd closed after the cheap ALLOW");
+        ASSERT(fanotify_test_active_dialog_pid() == 0,
+               "nested: published dialog pid restored after the seam returns");
+        ASSERT(fanotify_test_unanswered_count() == 0 &&
+                   fanotify_test_stranded_count() == 0,
+               "nested: allow writes cleanly, no retry queued");
+
+        struct fanotify_response resp;
+        ssize_t got = read(sv[1], &resp, sizeof(resp));
+        ASSERT(got == (ssize_t)sizeof(resp) && resp.fd == efd &&
+                   resp.response == FAN_ALLOW,
+               "nested: FAN_ALLOW written back through the fake group");
+        efd = -1;
+    }
+
+    unlink(path);
+    rmdir(dir);
+    close(sv[0]);
+    close(sv[1]);
+    close(discard[0]);
+    close(discard[1]);
+    g_config = saved;
+}
+
+/*
  * Part 0h3: a changed [allowlist] hash pin defers while a dialog is open
  * instead of stacking a hash-change prompt on it.  The dialog rate
  * limiter is exhausted first so a regression that reaches the prompt
@@ -4233,6 +4402,7 @@ int main(void) {
     test_session_allow_without_digest_stored();
     test_inconclusive_deny_gates_grants();
     test_pump_defer_contract();
+    test_pump_nested_skips_pipeline();
     test_pump_dialog_group_allow();
     test_pump_bounded_and_lossless();
     test_pump_flag_claims_inflight_buffer();

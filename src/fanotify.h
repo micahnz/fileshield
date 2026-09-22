@@ -438,4 +438,15 @@ void fanotify_test_reset_dialog_rate(void);
  */
 int fanotify_test_seed_mark(const char *path);
 
+/*
+ * Test seam: run fanotify_pump() with g_pump_in_pipeline forced set —
+ * exactly the state hash_wait_pump creates while a hash helper waits
+ * inside a defer-mode pipeline decision.  Pins the nested-pump branch
+ * (cheap fast-path allow for an unprotected target / defer the rest;
+ * never a recursive process_open_perm) without a live hash wait.  The
+ * flag is saved and restored around the call like the production
+ * set/clear pair.  Returns the pump's responded-event count.
+ */
+int fanotify_test_pump_nested(int fan_fd, pid_t dialog_pid);
+
 #endif
