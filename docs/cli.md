@@ -62,7 +62,7 @@ A rebuilt or updated binary stops matching its old _Always_ entry (the stored SH
 
 The call chain is compared level by level by comm name, so the same helper run from a different terminal (e.g. `... > zsh` vs `... > warp`) is a separate rule and never merged.
 
-Every matched group is listed before the confirmation prompt with its shared key and then each member — ID, `keep`/`remove`, creation time — so the grouping can be audited. When nothing matches, it prints `there are no results to prune` and exits without prompting. `-n`/`--dry-run` lists and exits without touching anything; `-y` skips the prompt.
+Every matched group is listed before the confirmation prompt with its shared key and then each member — ID, `keep`/`remove`, creation time — so the grouping can be audited. The report and prompt come from the state files; a running daemon may still hold ghost duplicates an empty file never showed, so when a listener answers `prune` always sends its request (with no prompt when the file showed nothing) and the daemon's removed count is what gets printed. When no daemon answers and nothing matches, it prints `there are no results to prune` and exits without prompting. `-n`/`--dry-run` lists and exits without touching anything; `-y` skips the prompt.
 
 ## Confirmation
 

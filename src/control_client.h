@@ -144,4 +144,25 @@ int control_client_call(const char *sock_path, const char *request,
                         char *resp_buf, size_t resp_size,
                         ControlResponse *out);
 
+/*
+ * Test seam: arm failure injection so the next control_client_call() --
+ * and every later one until disarmed -- returns -1 with errno == err
+ * before touching the filesystem or socket.  err == 0 disarms and
+ * restores normal behaviour.  Tests use this instead of ever connecting
+ * to /run/fileshield/control.sock; production never calls it, so the
+ * cost when disarmed is one static-int check.  Takes priority over
+ * control_client_test_set_socket_path().
+ */
+void control_client_test_fail_with(int err);
+
+/*
+ * Test seam: redirect every control_client_call() to connect at 'path'
+ * instead of the sock_path argument, so a test can point the CLI at a
+ * canned server under /tmp and never open CONTROL_SOCKET_PATH.  NULL or
+ * "" restores the normal behaviour; an over-long path is ignored and the
+ * previous redirect stays in effect.  Production never calls it (one
+ * static-byte check when disarmed).
+ */
+void control_client_test_set_socket_path(const char *path);
+
 #endif /* FILESHIELD_CONTROL_CLIENT_H */

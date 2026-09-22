@@ -304,6 +304,33 @@ long control_response_scalar(const ControlResponse *resp)
 /* Client                                                             */
 /* ------------------------------------------------------------------ */
 
+/* Test seam state (control_client_test_fail_with): while armed (non-zero),
+ * every call fails with this errno before any socket or filesystem work;
+ * 0 (the default) takes the normal path. */
+static int g_test_fail_err;
+
+void control_client_test_fail_with(int err)
+{
+    g_test_fail_err = err;
+}
+
+/* Test seam state (control_client_test_set_socket_path): when non-empty,
+ * every call connects here instead of the sock_path argument so tests can
+ * use a canned server under /tmp and never open CONTROL_SOCKET_PATH. */
+static char g_test_sock_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+
+void control_client_test_set_socket_path(const char *path)
+{
+    if (!path || path[0] == '\0')
+    {
+        g_test_sock_path[0] = '\0';
+        return;
+    }
+    if (strlen(path) >= sizeof(g_test_sock_path))
+        return; /* leave the previous redirect in effect */
+    memcpy(g_test_sock_path, path, strlen(path) + 1);
+}
+
 /* Blocking send of the request plus its newline.  The CLI socket is
  * blocking: a stuck daemon must surface as a slow command, not as a
  * silently dropped request. */
@@ -389,9 +416,22 @@ int control_client_call(const char *sock_path, const char *request,
     int fd;
     int rc = -1;
 
+    /* Test seam first: fail before validation, socket() or connect(), so
+     * an armed test can never reach the real control socket. */
+    if (g_test_fail_err != 0)
+    {
+        errno = g_test_fail_err;
+        return -1;
+    }
+
     if (!sock_path || sock_path[0] == '\0' || !request || !resp_buf ||
         resp_size < 2 || !out)
         return -1;
+
+    /* Socket-path redirect (also a test seam): after validation so a bad
+     * argument still fails the same way in tests and production. */
+    if (g_test_sock_path[0] != '\0')
+        sock_path = g_test_sock_path;
 
     path_len = strlen(sock_path);
     if (path_len >= sizeof(addr.sun_path))
