@@ -110,6 +110,13 @@ int utils_test_parse_proc_stat(const char *line, size_t n,
  * process.  Used by fork()ed children before exec() so no daemon file
  * descriptors (fanotify group fd, event fds, pipes) leak into helpers.
  * Uses close_range(2) when available and falls back to a bounded loop.
+ * Fallback cap: when SYS_close_range is unavailable AND
+ * sysconf(_SC_OPEN_MAX) > 65536, only fds below 65536 are closed — the
+ * loop is deliberately bounded so a huge RLIMIT_NOFILE cannot turn this
+ * into a long scan.  Production helper children inherit low fds, so this
+ * cap is the leak fence; the high-RLIMIT edge (fds >= 65536 surviving)
+ * is accepted and documented here rather than fixed by an unbounded
+ * scan.
  */
 void close_fds_from(int first);
 
