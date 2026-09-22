@@ -71,6 +71,10 @@ static int write_raw_file(const char *path, const char *content)
         return -1;
     }
     fclose(fp);
+    /* 0600: a root-run pin_load() refuses group/other-writable files,
+     * so raw fixtures must not depend on the ambient umask. */
+    if (chmod(path, 0600) != 0)
+        return -1;
     return 0;
 }
 
@@ -162,7 +166,8 @@ static int write_full_pin_file(const char *path, int victim, int all_equal)
         return -1;
     }
     fclose(fp);
-    return 0;
+    /* 0600: keep root-run loads past the ownership/mode trust bar. */
+    return chmod(path, 0600) == 0 ? 0 : -1;
 }
 
 static int write_over_cap_file(const char *path, int entries)
@@ -188,7 +193,8 @@ static int write_over_cap_file(const char *path, int entries)
         return -1;
     }
     fclose(fp);
-    return 0;
+    /* 0600: keep root-run loads past the ownership/mode trust bar. */
+    return chmod(path, 0600) == 0 ? 0 : -1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1518,6 +1524,116 @@ static int test_mutation_write_failure_restores_table(void)
 }
 
 /* ------------------------------------------------------------------ */
+/*  root refuses unsafe pin-file loads (M3 trust bar); ENOENT = TOFU   */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Regression for the config_load() trust bar mirrored into
+ * pin_load_file(): as root the loader refuses a pin file that is
+ * group/other-writable, not root-owned, or reached via a symlink.  The
+ * refusal is at least as strict as an fopen failure -- -1 with
+ * damaged_out=1 / pin_damaged()==1 (fail closed to the prompt), never
+ * an empty table that would silently re-TOFU every rule.  The guard
+ * runs only under geteuid()==0: unprivileged runs load the very same
+ * file cleanly, and the root-only cases SKIP when unprivileged.  ENOENT
+ * keeps meaning TOFU (0 rows, not damaged) for every euid.
+ */
+static int test_pin_unsafe_load_root_refused(void)
+{
+    char path[TPATH];
+    char victim[TPATH];
+    char json[PATH_MAX + 512];
+    char old[129];
+    PinRecord out[4];
+    int damaged = -1;
+
+    /* ENOENT for every euid, before any root-only case. */
+    make_test_path(path, sizeof(path), "unsafe_missing.json");
+    unlink(path);
+    memset(out, 'x', sizeof(out));
+    ASSERT(pin_load_file(path, out, 4, &damaged) == 0,
+           "missing pin file still returns 0 rows (ENOENT preserved)");
+    ASSERT(damaged == 0, "missing pin file is not damaged");
+    ASSERT(out[0].pattern[0] == '\0', "missing pin file yields an empty table");
+
+    build_valid_json(json, sizeof(json), "/usr/bin/unsafe", SHA_A, 5);
+
+    /* Group/other-writable file: refused (damaged) as root, loaded
+     * unchanged when unprivileged (the trust bar is root-only). */
+    make_test_path(path, sizeof(path), "unsafe_mode.json");
+    unlink(path);
+    ASSERT(write_raw_file(path, json) == 0, "write pin file");
+    ASSERT(chmod(path, 0666) == 0, "chmod 0666 the pin file");
+    if (geteuid() == 0)
+    {
+        ASSERT(pin_load(path) == -1,
+               "root refuses a group/other-writable pin file");
+        ASSERT(pin_damaged() == 1,
+               "refusal marks the table damaged (fail closed, not TOFU)");
+
+        damaged = -1;
+        ASSERT(pin_load_file(path, out, 4, &damaged) == -1,
+               "pin_load_file refuses the writable file");
+        ASSERT(damaged == 1,
+               "pin_load_file reports damage, not an empty/TOFU table");
+        ASSERT(out[0].pattern[0] == '\0', "refused load returns no rows");
+    }
+    else
+    {
+        ASSERT(pin_load(path) == 0,
+               "unprivileged load of a 0666 file is unaffected");
+        ASSERT(pin_damaged() == 0, "unprivileged load is clean");
+        ASSERT(pin_check("/usr/bin/unsafe", SHA_A, old) == PIN_CHECK_MATCH,
+               "unprivileged load keeps the pin");
+    }
+    unlink(path);
+
+    if (geteuid() != 0)
+    {
+        printf("SKIP: pin symlink/foreign-owner load refusal needs root\n");
+        TEST_PASS("pin trust bar (root-only) + ENOENT TOFU preserved");
+        return 0;
+    }
+
+    /* A symlink at the pin path: refused even though the target is a
+     * trustworthy root-owned 0600 file; the victim is untouched. */
+    make_test_path(victim, sizeof(victim), "unsafe_symlink_victim");
+    make_test_path(path, sizeof(path), "unsafe_symlink.json");
+    unlink(path);
+    unlink(victim);
+    ASSERT(write_raw_file(victim, json) == 0, "write symlink victim");
+    ASSERT(symlink(victim, path) == 0, "plant symlink at the pin path");
+    ASSERT(pin_load(path) == -1, "root refuses a symlinked pin file");
+    ASSERT(pin_damaged() == 1, "symlink refusal sets damaged");
+    ASSERT(access(victim, F_OK) == 0, "symlink victim left in place");
+    unlink(path);
+
+    /* A foreign-owned pin file: refused (chown needs root). */
+    make_test_path(path, sizeof(path), "unsafe_owner.json");
+    unlink(path);
+    ASSERT(write_raw_file(path, json) == 0, "write pin file");
+    ASSERT(chown(path, 1, 1) == 0, "chown the pin file to uid 1");
+    ASSERT(pin_load(path) == -1, "root refuses a non-root-owned pin file");
+    ASSERT(pin_damaged() == 1, "ownership refusal sets damaged");
+    unlink(path);
+
+    /* Control: a root-owned 0600 file still loads and clears damage. */
+    make_test_path(path, sizeof(path), "unsafe_control.json");
+    unlink(path);
+    ASSERT(write_raw_file(path, json) == 0, "write control pin file");
+    ASSERT(chmod(path, 0600) == 0, "chmod 0600 the control file");
+    ASSERT(pin_load(path) == 0, "root-owned 0600 pin file still loads");
+    ASSERT(pin_damaged() == 0, "control load is clean");
+    ASSERT(pin_check("/usr/bin/unsafe", SHA_A, old) == PIN_CHECK_MATCH,
+           "control pin matches");
+
+    unlink(path);
+    unlink(victim);
+    TEST_PASS("root refuses unsafe pin-file loads; ENOENT TOFU preserved");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  main                                                              */
 /* ------------------------------------------------------------------ */
 
@@ -1559,6 +1675,7 @@ int main(void)
     failed |= test_remove_ambiguous_id();
     failed |= test_pin_clear();
     failed |= test_mutation_write_failure_restores_table();
+    failed |= test_pin_unsafe_load_root_refused();
 
     rmdir(g_test_dir);
 
