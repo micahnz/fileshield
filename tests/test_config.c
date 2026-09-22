@@ -1098,10 +1098,11 @@ static void test_relative_protected_rejected(void)
 
 /*
  * Line handling and hard caps: CRLF endings parse cleanly (the trim
- * strips '\r'), a line longer than the parser buffer is skipped whole
- * (drained to its newline) with the rest of the config still loading,
- * and the MAX_RULES cap is exact -- loading at the cap, refusing at one
- * over (never silently truncating).
+ * strips '\r'), an over-long line in a RULE section refuses the whole
+ * config (never silently skipped — see test_overlong_line_refusal for
+ * the [settings]/comment cases that still skip), and the MAX_RULES cap
+ * is exact -- loading at the cap, refusing at one over (never silently
+ * truncating).
  */
 static void test_crlf_longline_and_rule_cap(void)
 {
@@ -1147,8 +1148,9 @@ static void test_crlf_longline_and_rule_cap(void)
         free(path);
     }
 
-    /* A line longer than the parser buffer (PATH_MAX * 2) is skipped
-     * whole and the following entry still loads. */
+    /* A line longer than the parser buffer (PATH_MAX * 2) in a rule
+     * section refuses the whole config: skipping it would silently
+     * drop the rule. */
     {
         char *conf = malloc(PATH_MAX * 2 + 512);
         ASSERT(conf != NULL, "alloc long-line config");
@@ -1166,12 +1168,8 @@ static void test_crlf_longline_and_rule_cap(void)
         char *path = write_temp(conf);
         ASSERT(path != NULL, "write long-line config");
         memset(&cfg, 0, sizeof(cfg));
-        ASSERT(config_load(path, &cfg) == 0,
-               "config with an over-long line still loads");
-        ASSERT(cfg.protected_count == 1,
-               "over-long line skipped, following entry kept");
-        ASSERT(strcmp(cfg.protected[0].path, "/tmp/fileshield_long_ok") == 0,
-               "valid entry after the over-long line survives");
+        ASSERT(config_load(path, &cfg) == -1,
+               "over-long line in a rule section refuses the config");
         config_reset(&cfg);
         unlink(path);
         free(path);
@@ -1212,6 +1210,114 @@ static void test_crlf_longline_and_rule_cap(void)
         unlink(path);
         free(path);
     }
+}
+
+/*
+ * M4 regression: an over-long line that no longer fits the PATH_MAX*2
+ * parse buffer must refuse the WHOLE config inside a rule section
+ * ([protected_paths]/[allowlist]/[unsafe_allowlist]/[denylist]) —
+ * skipping it would silently drop the rule, breaking docs/
+ * configuration.md's "a typo cannot silently drop rules" promise
+ * (fails before the fix).  [settings] lines, comments/blank lines and
+ * preamble garbage drop no rules, so they keep the historical
+ * skip-with-log behavior.
+ */
+static void test_overlong_line_refusal(void)
+{
+    static Config cfg; /* PATH_MAX-wide tables: keep them off the stack */
+    /* Largest body: PATH_MAX*2 filler plus a header/entry around it. */
+    char *conf = malloc(PATH_MAX * 2 + 512);
+    ASSERT(conf != NULL, "alloc over-long line config");
+    if (!conf)
+        return;
+
+    /* [denylist] non-comment rule: refuse the whole config. */
+    {
+        char *p = conf;
+        p += sprintf(p, "[denylist]\n/usr/bin/");
+        memset(p, 'd', PATH_MAX * 2);
+        p += PATH_MAX * 2;
+        *p++ = '\n';
+        *p = '\0';
+
+        char *path = write_temp(conf);
+        ASSERT(path != NULL, "write over-long denylist config");
+        memset(&cfg, 0, sizeof(cfg));
+        ASSERT(config_load(path, &cfg) == -1,
+               "over-long denylist rule refuses the config");
+        config_reset(&cfg);
+        unlink(path);
+        free(path);
+    }
+
+    /* [settings]: over-long value keeps the historical skip; the rest
+     * of the section still loads. */
+    {
+        char *p = conf;
+        p += sprintf(p, "[settings]\nnotify_max ");
+        memset(p, 'x', PATH_MAX * 2);
+        p += PATH_MAX * 2;
+        *p++ = '\n';
+        p += sprintf(p, "user_ttl = 42\n");
+        *p = '\0';
+
+        char *path = write_temp(conf);
+        ASSERT(path != NULL, "write over-long settings config");
+        memset(&cfg, 0, sizeof(cfg));
+        ASSERT(config_load(path, &cfg) == 0,
+               "over-long settings line still loads");
+        ASSERT(cfg.user_ttl_seconds == 42,
+               "setting after the over-long settings line applies");
+        config_reset(&cfg);
+        unlink(path);
+        free(path);
+    }
+
+    /* An over-long COMMENT inside a rule section never refuses: only
+     * the available prefix is examined for the '#' decision. */
+    {
+        char *p = conf;
+        p += sprintf(p, "[protected_paths]\n/tmp/fileshield_olc_ok\n#");
+        memset(p, 'c', PATH_MAX * 2);
+        p += PATH_MAX * 2;
+        *p++ = '\n';
+        *p = '\0';
+
+        char *path = write_temp(conf);
+        ASSERT(path != NULL, "write over-long comment config");
+        memset(&cfg, 0, sizeof(cfg));
+        ASSERT(config_load(path, &cfg) == 0,
+               "over-long comment in a rule section does not refuse");
+        ASSERT(cfg.protected_count == 1,
+               "entry before the over-long comment survives");
+        config_reset(&cfg);
+        unlink(path);
+        free(path);
+    }
+
+    /* Preamble garbage before any header: skip, matching the
+     * entry-outside-any-section handling. */
+    {
+        char *p = conf;
+        memset(p, 'g', PATH_MAX * 2);
+        p += PATH_MAX * 2;
+        *p++ = '\n';
+        p += sprintf(p, "[protected_paths]\n/tmp/fileshield_olp_ok\n");
+        *p = '\0';
+
+        char *path = write_temp(conf);
+        ASSERT(path != NULL, "write over-long preamble config");
+        memset(&cfg, 0, sizeof(cfg));
+        ASSERT(config_load(path, &cfg) == 0,
+               "over-long preamble garbage still loads");
+        ASSERT(cfg.protected_count == 1,
+               "header after the over-long preamble line is honored");
+        config_reset(&cfg);
+        unlink(path);
+        free(path);
+    }
+
+    free(conf);
 }
 
 /*
@@ -1961,6 +2067,7 @@ int main(void)
     test_debug_staging();
     test_relative_protected_rejected();
     test_crlf_longline_and_rule_cap();
+    test_overlong_line_refusal();
     test_inline_hash_rejected();
     test_settings_user_ttl();
     test_settings_session_ttl();
