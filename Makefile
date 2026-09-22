@@ -43,10 +43,15 @@ OBJS    := $(SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
 CLIOBJS := $(OBJDIR)/cli.o $(OBJDIR)/cli_ui.o $(OBJDIR)/control_client.o \
            $(OBJDIR)/persist.o $(OBJDIR)/pin.o $(OBJDIR)/prune.o \
            $(OBJDIR)/ruleid.o $(OBJDIR)/sha512.o $(OBJDIR)/utils.o
-DEPS    := $(sort $(OBJS:.o=.d) $(CLIOBJS:.o=.d))
+# Test-only twin of cli.o: same source, main renamed to cli_test_main so
+# test_cli can fork() one invocation per case.  Never linked into
+# fileshield or fileshield-cli.  Derived from CLIOBJS so the two lists
+# cannot drift.
+CLITESTOBJS := $(patsubst $(OBJDIR)/cli.o,$(OBJDIR)/cli_test.o,$(CLIOBJS))
+DEPS    := $(sort $(OBJS:.o=.d) $(CLIOBJS:.o=.d) $(OBJDIR)/cli_test.d)
 
 TESTS   := test_cache test_config test_reload test_utils test_persist test_pin test_session test_sha512 test_inode test_fanotify \
-           test_ruleid test_prune test_cli_ui test_control
+           test_ruleid test_prune test_cli_ui test_control test_cli
 TSTBINS := $(TESTS:%=$(OBJDIR)/%)
 
 all: $(OBJDIR)/$(TARGET) $(OBJDIR)/$(CLITGT)
@@ -65,6 +70,13 @@ $(OBJDIR)/$(CLITGT): $(CLIOBJS)
 $(OBJDIR)/%.o: $(SRCDIR)/%.c
 	@mkdir -p $(OBJDIR)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+# -DFILESHIELD_TEST_CLI renames main -> cli_test_main (and compiles the
+# state-file test redirect).  Explicit rule: the pattern rule would look
+# for src/cli_test.c, which does not exist.
+$(OBJDIR)/cli_test.o: $(SRCDIR)/cli.c
+	@mkdir -p $(OBJDIR)
+	$(CC) $(CFLAGS) -MMD -MP -DFILESHIELD_TEST_CLI -c $< -o $@
 
 -include $(DEPS)
 
@@ -124,6 +136,12 @@ $(OBJDIR)/test_control: $(TSTDIR)/test_control.c $(OBJDIR)/control.o $(OBJDIR)/c
 		$(OBJDIR)/sha512.o $(OBJDIR)/persist.o $(OBJDIR)/inode.o \
 		$(OBJDIR)/pin.o $(OBJDIR)/ruleid.o $(OBJDIR)/prune.o \
 		$(OBJDIR)/utils.o -o $@
+
+# CLI behaviour suite: links the test twin of cli.c (cli_test.o) instead
+# of cli.o so main never collides and the suite can fork() each case.
+$(OBJDIR)/test_cli: $(TSTDIR)/test_cli.c $(CLITESTOBJS)
+	@mkdir -p $(OBJDIR)
+	$(CC) $(CFLAGS) $(LDFLAGS) $(TSTDIR)/test_cli.c $(CLITESTOBJS) -o $@
 
 # Links the full event pipeline: fanotify.o needs notify/config/cache/
 # session/sha512/persist/utils, and the test supplies the daemon's signal
