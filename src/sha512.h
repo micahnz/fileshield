@@ -61,4 +61,15 @@ int sha512_string(const char *str, char hex_out[129]);
  */
 int sha512_buf(const void *data, size_t len, char hex_out[129]);
 
+/*
+ * Test seam: override the sha512sum helper binary forked by
+ * sha512_file()/sha512_proc_exe() (NULL or "" restores
+ * /usr/bin/sha512sum).  Production never calls this; with the seam
+ * unset the helper path, argv, timeout and reap behavior are identical
+ * to a build without it.  Lets a test substitute a slow stand-in that
+ * emits a digest and then stalls, exercising the bounded kill/reap
+ * deadline (REAP_DEADLINE_S) without touching the reap loop itself.
+ */
+void sha512_test_set_helper(const char *path);
+
 #endif /* FILESHIELD_SHA512_H */

@@ -4,6 +4,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -451,6 +452,25 @@ static int collect_digest(int fd, pid_t pid, const char *label,
     return 0;
 }
 
+/*
+ * Test seam (sha512.h): override the hash helper binary.  Empty (the
+ * default) selects /usr/bin/sha512sum below, so production helper path,
+ * argv, timeout and reap behavior are byte-identical when the seam is
+ * unset; tests point it at a slow stand-in to exercise the bounded
+ * kill/reap path (kill_helper_bounded / REAP_DEADLINE_S).
+ */
+static char g_test_helper[PATH_MAX] = "";
+
+void sha512_test_set_helper(const char *path)
+{
+    if (!path || path[0] == '\0')
+    {
+        g_test_helper[0] = '\0';
+        return;
+    }
+    snprintf(g_test_helper, sizeof(g_test_helper), "%s", path);
+}
+
 int sha512_file(const char *path, char hex_out[129])
 {
     int pipefd[2];
@@ -486,8 +506,12 @@ int sha512_file(const char *path, char hex_out[129])
         /*
          * Pass the path as a separate argument — no shell involved, so
          * no command-injection risk regardless of the path content.
+         * The test seam swaps only the executable; argv is unchanged,
+         * and with the seam unset this is the original exec exactly.
          */
-        execl("/usr/bin/sha512sum", "sha512sum", "--", path, (char *)NULL);
+        const char *helper =
+            g_test_helper[0] ? g_test_helper : "/usr/bin/sha512sum";
+        execl(helper, "sha512sum", "--", path, (char *)NULL);
         _exit(127);
     }
 
