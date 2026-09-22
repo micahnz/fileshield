@@ -2768,6 +2768,175 @@ static void test_batch_abandon_claims_stranded(void) {
 }
 
 /*
+ * Part 0c-m6a: event_resolve()'s FAN_NOFD branch must log and skip
+ * WITHOUT responding (M6).  The kernel already auto-DENIES permission
+ * events whose fd creation fails, so there is no event fd to answer:
+ * a write with fd=-1 earns EINVAL on a real group, sets g_fatal and
+ * queues a phantom retry that can never be delivered.  A pipe stands in
+ * for the group — before the fix the DENY response lands in it and the
+ * read below finds bytes.
+ */
+static void test_resolve_nofd_skips_respond(void) {
+    log_msg(LOG_DEBUG, "warm up syslog before resolve-nofd pipe");
+
+    int group[2] = { -1, -1 };
+    ASSERT(pipe(group) == 0, "create resolve-nofd probe pipe");
+    if (group[0] < 0)
+        return;
+
+    g_fatal = 0;
+    ASSERT(fanotify_test_resolve_nofd(group[1]) == 1,
+           "FAN_NOFD resolve returns handled (decided)");
+    ASSERT(g_fatal == 0, "FAN_NOFD resolve never sets g_fatal");
+    ASSERT(fanotify_test_unanswered_count() == 0 &&
+               fanotify_test_stranded_count() == 0,
+           "FAN_NOFD resolve queues no phantom retry");
+
+    close(group[1]); /* EOF: any response already written would be readable */
+    char probe[64];
+    ssize_t got = read(group[0], probe, sizeof(probe));
+    ASSERT(got == 0, "no response bytes written for FAN_NOFD");
+    close(group[0]);
+}
+
+/*
+ * Part 0c-m6b: fanotify_pump()'s FAN_OPEN_PERM+FAN_NOFD branch must
+ * likewise log and skip without responding (M6).  The pump is public, so
+ * a socketpair (bidirectional, exactly like the real group fd) drives the
+ * real walk: before the fix the branch's FAN_DENY response arrives on the
+ * peer; after it, nothing is written, nothing is queued, and the pump
+ * counts no response.
+ */
+static void test_pump_nofd_skips_respond(void) {
+    log_msg(LOG_DEBUG, "warm up syslog before pump-nofd socketpair");
+
+    int sv[2] = { -1, -1 };
+    ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0,
+           "socketpair as fake fanotify group");
+    if (sv[0] < 0)
+        return;
+    int fl = fcntl(sv[0], F_GETFL, 0);
+    ASSERT(fl >= 0 && fcntl(sv[0], F_SETFL, fl | O_NONBLOCK) == 0,
+           "make the fake group non-blocking like FAN_NONBLOCK");
+    fl = fcntl(sv[1], F_GETFL, 0);
+    ASSERT(fl >= 0 && fcntl(sv[1], F_SETFL, fl | O_NONBLOCK) == 0,
+           "non-blocking response side: a missing answer must not hang");
+
+    ASSERT(fanotify_test_unanswered_count() == 0,
+           "retry queue empty before the pump-nofd run");
+
+    static char rec[sizeof(struct fanotify_event_metadata)]
+        __attribute__((aligned(__alignof__(struct fanotify_event_metadata))));
+    struct fanotify_event_metadata *md =
+        (struct fanotify_event_metadata *)rec;
+    memset(rec, 0, sizeof(rec));
+    md->event_len = sizeof(*md);
+    md->metadata_len = sizeof(*md);
+    md->vers = FANOTIFY_METADATA_VERSION;
+    md->mask = FAN_OPEN_PERM;
+    md->fd = FAN_NOFD;
+    md->pid = (int)getpid();
+
+    g_fatal = 0;
+    ASSERT(write(sv[1], rec, sizeof(*md)) == (ssize_t)sizeof(*md),
+           "feed one FAN_NOFD permission event");
+
+    int responded = fanotify_pump(sv[0], 0);
+    ASSERT(responded == 0, "FAN_NOFD event counts as no response");
+    ASSERT(g_fatal == 0, "pump FAN_NOFD never sets g_fatal");
+    ASSERT(fanotify_test_unanswered_count() == 0 &&
+               fanotify_test_stranded_count() == 0,
+           "pump FAN_NOFD queues no phantom retry");
+
+    struct fanotify_response resp;
+    ssize_t got = read(sv[1], &resp, sizeof(resp));
+    ASSERT(got < 0 && errno == EAGAIN,
+           "no response written for FAN_NOFD (pump skips the write)");
+
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/*
+ * Part 0c-c1: event_next()'s tri-state.  A valid batch advances with
+ * *malformed left 0; a clean end (no full header left) also leaves it 0
+ * and stays silent; an invalid event_len — zero, oversized, or otherwise
+ * outside the walk contract, whether on the current record or on the
+ * record about to be returned — sets it: the remainder of the batch is
+ * unlocatable and the caller logs loudly instead of guessing.
+ */
+static void test_event_next_tri_state(void) {
+    static char raw[3 * sizeof(struct fanotify_event_metadata)]
+        __attribute__((aligned(__alignof__(struct fanotify_event_metadata))));
+    struct fanotify_event_metadata *rec =
+        (struct fanotify_event_metadata *)raw;
+    const ssize_t HDR = (ssize_t)sizeof(struct fanotify_event_metadata);
+    const struct fanotify_event_metadata *next;
+    ssize_t remaining;
+    int malformed;
+
+    for (int i = 0; i < 3; i++) {
+        memset(&rec[i], 0, (size_t)HDR);
+        rec[i].event_len = (unsigned int)HDR;
+        rec[i].vers = FANOTIFY_METADATA_VERSION;
+        rec[i].metadata_len = (unsigned int)HDR;
+        rec[i].fd = FAN_NOFD;
+    }
+
+    /* Valid batch advances, unflagged. */
+    remaining = 2 * HDR;
+    malformed = -1;
+    next = fanotify_test_event_next(&rec[0], &remaining, &malformed);
+    ASSERT(next == &rec[1], "valid batch advances to the next record");
+    ASSERT(malformed == 0, "valid advance is not flagged malformed");
+
+    /* Exact end of batch: NULL with malformed left 0 (clean, silent). */
+    remaining = HDR;
+    malformed = -1;
+    next = fanotify_test_event_next(&rec[1], &remaining, &malformed);
+    ASSERT(next == NULL, "clean end returns NULL");
+    ASSERT(malformed == 0, "clean end is not flagged malformed");
+    remaining = HDR;
+    malformed = -1;
+    next = fanotify_test_event_next(&rec[0], &remaining, &malformed);
+    ASSERT(next == NULL && malformed == 0,
+           "a single-record batch ends cleanly");
+
+    /* Zero-length current record: flagged. */
+    rec[0].event_len = 0;
+    remaining = 2 * HDR;
+    malformed = 0;
+    next = fanotify_test_event_next(&rec[0], &remaining, &malformed);
+    ASSERT(next == NULL && malformed == 1,
+           "zero-length event_len is flagged malformed");
+
+    /* Oversized current record: flagged. */
+    rec[0].event_len = (unsigned int)(3 * HDR); /* > remaining */
+    remaining = 2 * HDR;
+    malformed = 0;
+    next = fanotify_test_event_next(&rec[0], &remaining, &malformed);
+    ASSERT(next == NULL && malformed == 1,
+           "oversized event_len is flagged malformed");
+    rec[0].event_len = (unsigned int)HDR;
+
+    /* Valid current, malformed NEXT record (the walk-reachable case):
+     * the current record was handled, only the tail is lost. */
+    rec[1].event_len = 0;
+    remaining = 2 * HDR;
+    malformed = 0;
+    next = fanotify_test_event_next(&rec[0], &remaining, &malformed);
+    ASSERT(next == NULL && malformed == 1,
+           "a zero-length tail record is flagged malformed");
+
+    rec[1].event_len = (unsigned int)(2 * HDR); /* > remaining after step */
+    remaining = 2 * HDR;
+    malformed = 0;
+    next = fanotify_test_event_next(&rec[0], &remaining, &malformed);
+    ASSERT(next == NULL && malformed == 1,
+           "an oversized tail record is flagged malformed");
+}
+
+/*
  * Part 0c-bis: pump-level dialog-group fast path and the M2 publish
  * contract.  A socketpair stands in for the fanotify group (read and
  * write share one fd, exactly like the real one).  An event whose pid IS
@@ -4103,6 +4272,9 @@ int main(void) {
     test_unanswered_queue_grows();
     test_unanswered_stranded_fallback();
     test_batch_abandon_claims_stranded();
+    test_resolve_nofd_skips_respond();
+    test_pump_nofd_skips_respond();
+    test_event_next_tri_state();
     test_clear_marks_retains_failures();
     test_cmdline_fingerprint_overflow();
     test_drain_and_deny();

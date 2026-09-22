@@ -2961,15 +2961,24 @@ static void ctx_respond(EventCtx *c, unsigned int response)
 /*
  * Stage 1: sanity-check the event fd and resolve the target path from
  * the daemon's fd table.  Returns 1 when the event was decided here
- * (FAN_NOFD or an unresolvable path — both deny, fail closed).
+ * (FAN_NOFD — skipped without a response, the kernel already denied it —
+ * or an unresolvable path, which denies fail closed).
  */
 static int event_resolve(EventCtx *c)
 {
     if (c->fd_num == FAN_NOFD)
     {
-        log_msg(LOG_WARNING, "[event] FAN_NOFD for pid=%d, denying",
+        /* No event fd exists: the kernel already auto-DENIED this
+         * permission event when its fd creation failed (fanotify_read:
+         * copy_event_to_user failure -> finish_permission_event(FAN_DENY)),
+         * so FAN_OPEN_PERM+FAN_NOFD is unreachable for this fd-based
+         * group — pure defense.  Responding with fd=-1 would earn EINVAL,
+         * set g_fatal and queue a phantom retry that can never be
+         * delivered: log and skip as handled. */
+        log_msg(LOG_WARNING,
+                "[event] FAN_NOFD for pid=%d; kernel already denied, "
+                "skipping respond",
                 (int)c->ev->pid);
-        respond_event(c, FAN_DENY);
         return 1;
     }
 
@@ -3942,23 +3951,57 @@ unsigned int fanotify_test_record_allow_decision(const char *binary,
 
 /*
  * Advance to the next event in one read(2) batch.  Encapsulates the
- * offset arithmetic and the malformed-length guard: a zero or oversized
- * event_len must end the walk instead of looping or stepping outside the
- * buffer.  Returns NULL when the batch is exhausted (the caller's
- * while (FAN_EVENT_OK(...)) then also fails and exits).
+ * offset arithmetic and the malformed-length guard: an event_len outside
+ * the walk contract ([header, remaining]) makes every record behind this
+ * position unlocatable, so the walk ends instead of looping or stepping
+ * outside the buffer.  Tri-state: returns the next record on advance;
+ * NULL with *malformed == 0 for a clean end (the caller's while
+ * (FAN_EVENT_OK(...)) also fails and exits, silently); NULL with
+ * *malformed == 1 when a record length is invalid — the current record
+ * was already handled by the caller, only the tail is lost, and the
+ * caller logs loudly rather than guessing positions (the stance
+ * batch_abandon documents).  A record returned here always satisfies
+ * FAN_EVENT_OK.
  */
 static const struct fanotify_event_metadata *
-event_next(const struct fanotify_event_metadata *ev, ssize_t *remaining)
+event_next(const struct fanotify_event_metadata *ev, ssize_t *remaining,
+           int *malformed)
 {
-    if (ev->event_len == 0 || (ssize_t)ev->event_len > *remaining)
+    const struct fanotify_event_metadata *next;
+
+    *malformed = 0;
+    if (!FAN_EVENT_OK(ev, (size_t)*remaining))
+    {
+        *malformed = 1;
         return NULL;
+    }
     *remaining -= (ssize_t)ev->event_len;
     /* Less than one header left: no full record (and therefore no
      * duplicated event fd) can hide in the tail, so the walk ends. */
     if (*remaining < (ssize_t)sizeof(struct fanotify_event_metadata))
         return NULL;
-    return (const struct fanotify_event_metadata *)((const char *)ev +
+    next = (const struct fanotify_event_metadata *)((const char *)ev +
                                                     ev->event_len);
+    if (!FAN_EVENT_OK(next, (size_t)*remaining))
+    {
+        *malformed = 1;
+        return NULL;
+    }
+    return next;
+}
+
+/*
+ * Shared loud reaction to event_next()'s malformed flag: a record whose
+ * length is invalid makes the rest of the batch unlocatable, so the tail
+ * is dropped rather than guessed at.  The current record was already
+ * handled; only the remainder is lost.  A clean end stays silent.
+ */
+static void log_batch_tail_lost(ssize_t remaining)
+{
+    log_msg(LOG_ERR,
+            "fanotify batch: malformed record length; the remainder of the "
+            "batch (%zd bytes) is unlocatable and was dropped",
+            remaining);
 }
 
 /* ------------------------------------------------------------------ */
@@ -4133,6 +4176,7 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
         const struct fanotify_event_metadata *ev =
             (const struct fanotify_event_metadata *)buf;
         ssize_t remaining = n;
+        int malformed = 0;
 
         while (FAN_EVENT_OK(ev, (size_t)remaining))
         {
@@ -4166,13 +4210,17 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
             }
             else if (ev->mask & FAN_OPEN_PERM)
             {
-                /* FAN_NOFD (kernel fd-creation failure): there is no event
-                 * fd to close, but the requester's open() must not stay
-                 * kernel-blocked.  Respond and move on, mirroring
-                 * event_resolve() in the main loop (fail closed). */
-                log_msg(LOG_WARNING, "[pump] FAN_NOFD for pid=%d, denying",
+                /* FAN_NOFD (kernel fd-creation failure): unreachable for
+                 * this fd-based group — the kernel already auto-DENIED
+                 * the permission event (fanotify_read: copy_event_to_user
+                 * failure -> finish_permission_event(FAN_DENY)), so this
+                 * branch is pure defense.  There is no event fd to answer
+                 * with: a write with fd=-1 would earn EINVAL, set g_fatal
+                 * and queue a phantom retry.  Log and skip as handled. */
+                log_msg(LOG_WARNING,
+                        "[pump] FAN_NOFD for pid=%d; kernel already denied, "
+                        "skipping respond",
                         (int)ev->pid);
-                fanotify_respond(fan_fd, ev, FAN_DENY);
             }
             else if (ev->mask & (FAN_CREATE | FAN_MOVED_TO))
             {
@@ -4200,10 +4248,12 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
              * batch_abandon() below; nothing is left open or unanswered. */
             if (g_fatal || !g_running || g_need_reload)
                 break;
-            ev = event_next(ev, &remaining);
+            ev = event_next(ev, &remaining, &malformed);
             if (!ev)
                 break;
         }
+        if (malformed)
+            log_batch_tail_lost(remaining);
         if (g_fatal || !g_running || g_need_reload)
         {
             /* Claim the records this walk exited in front of before
@@ -4590,7 +4640,9 @@ static int batch_abandon(int fan_fd,
                          const struct fanotify_event_metadata *ev,
                          ssize_t remaining)
 {
-    const struct fanotify_event_metadata *next = event_next(ev, &remaining);
+    int malformed = 0;
+    const struct fanotify_event_metadata *next =
+        event_next(ev, &remaining, &malformed);
     int denied = 0;
 
     while (next)
@@ -4619,8 +4671,14 @@ static int batch_abandon(int fan_fd,
         {
             close((int)next->fd);
         }
-        next = event_next(next, &remaining);
+        next = event_next(next, &remaining, &malformed);
     }
+
+    if (malformed)
+        log_msg(LOG_ERR,
+                "abandoned fanotify batch: malformed record length; "
+                "the rest of the batch (%zd bytes) cannot be claimed",
+                remaining);
 
     if (denied > 0)
         log_msg(LOG_WARNING,
@@ -4722,6 +4780,7 @@ void fanotify_drain_and_deny(int fan_fd)
         const struct fanotify_event_metadata *ev =
             (const struct fanotify_event_metadata *)buf;
         ssize_t remaining = n;
+        int malformed = 0;
 
         while (FAN_EVENT_OK(ev, (size_t)remaining))
         {
@@ -4743,10 +4802,12 @@ void fanotify_drain_and_deny(int fan_fd)
                 close((int)ev->fd);
             }
 
-            ev = event_next(ev, &remaining);
+            ev = event_next(ev, &remaining, &malformed);
             if (!ev)
                 break;
         }
+        if (malformed)
+            log_batch_tail_lost(remaining);
     }
 
     if (denied > 0)
@@ -4939,6 +5000,7 @@ void fanotify_loop(int fd, int wake_fd, int control_fd)
         ev = (const struct fanotify_event_metadata *)buf;
         {
             ssize_t remaining = n;
+            int malformed = 0;
 
             while (FAN_EVENT_OK(ev, (size_t)remaining))
             {
@@ -5000,10 +5062,12 @@ void fanotify_loop(int fd, int wake_fd, int control_fd)
                     batch_abandon(fd, ev, remaining);
                     break;
                 }
-                ev = event_next(ev, &remaining);
+                ev = event_next(ev, &remaining, &malformed);
                 if (!ev)
                     break;
             }
+            if (malformed)
+                log_batch_tail_lost(remaining);
         }
 
         if (!g_running || g_need_reload || g_fatal)
@@ -5334,6 +5398,46 @@ int fanotify_test_batch_abandon(int group_fd,
                                 ssize_t remaining)
 {
     return batch_abandon(group_fd, ev, remaining);
+}
+
+/*
+ * Test seam (fanotify.h): event_next()'s tri-state.  Returns the next
+ * batch record or NULL; *malformed is 1 only when an invalid event_len
+ * makes the rest of the batch unlocatable, 0 for a clean end.
+ */
+const struct fanotify_event_metadata *
+fanotify_test_event_next(const struct fanotify_event_metadata *ev,
+                         ssize_t *remaining, int *malformed)
+{
+    return event_next(ev, remaining, malformed);
+}
+
+/*
+ * Test seam (fanotify.h): event_resolve()'s FAN_NOFD branch.  Runs the
+ * real stage-1 check on a synthetic context whose event fd is FAN_NOFD
+ * and returns its verdict (1 = handled).  group_fd (a pipe write end
+ * stands in for the group) must receive NO fanotify_response bytes:
+ * there is no event fd to answer, the kernel already denied the event,
+ * and a write with fd=-1 would earn EINVAL -> g_fatal -> a phantom retry.
+ */
+int fanotify_test_resolve_nofd(int group_fd)
+{
+    struct fanotify_event_metadata ev;
+    EventCtx c;
+
+    memset(&ev, 0, sizeof(ev));
+    ev.event_len = sizeof(ev);
+    ev.vers = FANOTIFY_METADATA_VERSION;
+    ev.metadata_len = sizeof(ev);
+    ev.mask = FAN_OPEN_PERM;
+    ev.fd = FAN_NOFD;
+    ev.pid = (int)getpid();
+
+    memset(&c, 0, sizeof(c));
+    c.fan_fd = group_fd;
+    c.ev = &ev;
+    c.fd_num = FAN_NOFD;
+    return event_resolve(&c);
 }
 
 /*

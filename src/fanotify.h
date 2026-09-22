@@ -328,6 +328,26 @@ int fanotify_test_batch_abandon(int group_fd,
                                 ssize_t remaining);
 
 /*
+ * Test seam: event_next()'s tri-state batch advance.  Returns the next
+ * record or NULL; *malformed is set to 1 only when a zero/oversized
+ * (otherwise invalid) event_len makes the rest of the batch unlocatable,
+ * and left 0 for a clean end of the batch (the silent, normal path).
+ */
+const struct fanotify_event_metadata *
+fanotify_test_event_next(const struct fanotify_event_metadata *ev,
+                         ssize_t *remaining, int *malformed);
+
+/*
+ * Test seam: event_resolve()'s FAN_NOFD branch (M6).  Runs the real
+ * stage-1 check on a synthetic context whose event fd is FAN_NOFD and
+ * returns its verdict (1 = handled).  group_fd — a pipe write end stands
+ * in for the group — must receive NO fanotify_response bytes: no event
+ * fd exists to answer, the kernel already auto-DENIED the event, and a
+ * write with fd=-1 would earn EINVAL -> g_fatal -> a phantom retry.
+ */
+int fanotify_test_resolve_nofd(int group_fd);
+
+/*
  * Test seams: the failed-response retry queue.  fanotify_test_respond()
  * runs the real fanotify_respond() against any writable fd (a pipe
  * stand-in receives the fanotify_response writes) and returns 0 when the
