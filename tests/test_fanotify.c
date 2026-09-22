@@ -3790,6 +3790,82 @@ static void test_session_allow_without_digest_stored(void) {
 }
 
 /*
+ * Part 0h0: deny-vs-hash-failure inconclusiveness gates every grant
+ * stage.  A digest-bearing session deny whose current digest is
+ * unavailable must reach the dialog (verdict 0), never be granted (2)
+ * by a hash-free stage such as a live file cache.  Pre-fix the deny
+ * matcher skipped the unverifiable entry as "no match", so the file
+ * cache decided and this test failed with verdict 2.  The controls pin
+ * the unchanged edges: no deny -> cache grants, a conclusive digest
+ * still denies outright, and a digest-less deny still matches any
+ * current digest (AppImage-side conservatism).
+ */
+static void test_inconclusive_deny_gates_grants(void) {
+    static Config cfg;
+    Config *saved = g_config;
+    pid_t sid = 0;
+    unsigned long long start = 0;
+    const char *bin = "/bin/tool-inconclusive";
+    const char *target = "/home/u/secret";
+    PersistEntry de;
+
+    memset(&cfg, 0, sizeof(cfg));
+    g_config = &cfg;
+    session_clear();
+    cache_clear();
+    fanotify_load_dyn_denylist(NULL, 0); /* isolate from earlier fixtures */
+
+    ASSERT(session_id_of(getpid(), &sid, &start) == 0, "resolve own session");
+
+    /* A live "Allow Once" cache entry for this exact request. */
+    cache_insert(getpid(), bin, target, 60);
+    ASSERT(cache_lookup(getpid(), bin, target) > 0, "cache entry is live");
+
+    /* Control: with no deny recorded, the file cache grants (2). */
+    ASSERT(fanotify_test_verdict_stage(bin, "", target, NULL, sid, 0, 0) == 2,
+           "file cache grants when no deny is recorded");
+
+    /* Digest-bearing session deny + empty current digest: inconclusive,
+     * so every grant stage is gated and the event would prompt (0). */
+    session_deny_add(sid, start, bin, PIN_SHA_A, target, 60);
+    ASSERT(fanotify_test_verdict_stage(bin, "", target, NULL, sid, 0, 0) == 0,
+           "inconclusive deny gates the file-cache grant (prompt, not grant)");
+
+    /* Control: with the recorded digest the deny is conclusive (1). */
+    ASSERT(fanotify_test_verdict_stage(bin, PIN_SHA_A, target, NULL, sid, 0,
+                                       0) == 1,
+           "conclusive digest match still denies");
+
+    /* Control: a digest-less deny still matches any current digest. */
+    session_clear();
+    session_deny_add(sid, start, bin, "", target, 60);
+    ASSERT(fanotify_test_verdict_stage(bin, "", target, NULL, sid, 0, 0) == 1,
+           "digest-less deny still matches an unverifiable digest");
+
+    /* The dynamic deny list reports the same three-way outcome.  The load
+     * admission requires the command line too (require_cmdline=1), so the
+     * fixture must carry it or dyn_admits drops the entry fail-closed and
+     * the matcher sees an empty list. */
+    memset(&de, 0, sizeof(de));
+    snprintf(de.binary, sizeof(de.binary), "%s", bin);
+    snprintf(de.binary_sha512, sizeof(de.binary_sha512), "%s", PIN_SHA_A);
+    snprintf(de.target_path, sizeof(de.target_path), "%s", target);
+    snprintf(de.cmdline, sizeof(de.cmdline), "cmd");
+    ASSERT(sha512_string("cmd", de.cmdline_sha512) == 0,
+           "hash the fixture command line");
+    fanotify_load_dyn_denylist(&de, 1);
+    ASSERT(fanotify_test_dyn_deny_match(bin, "", target, "cmd") == -1,
+           "dyn deny: path + stored digest + empty hash = inconclusive");
+    ASSERT(fanotify_test_dyn_deny_match(bin, "", "/home/u/other", "cmd") == 0,
+           "dyn deny: hash failure alone (no path match) is not inconclusive");
+    fanotify_load_dyn_denylist(NULL, 0);
+
+    session_clear();
+    cache_clear();
+    g_config = saved;
+}
+
+/*
  * Part 0h2: the pump's defer-mode contract.  While another dialog is
  * open, the pump runs the full pipeline and maps its verdict directly:
  *   verdict != 0 (a deny or a grant stage decided) -> respond mid-dialog,
@@ -3986,6 +4062,7 @@ int main(void) {
     test_html_escape();
     test_verdict_stage_order();
     test_session_allow_without_digest_stored();
+    test_inconclusive_deny_gates_grants();
     test_pump_defer_contract();
     test_pump_dialog_group_allow();
     test_pump_bounded_and_lossless();

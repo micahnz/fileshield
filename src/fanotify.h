@@ -204,6 +204,11 @@ int fanotify_prune_dyn_list(int deny, int *removed_out);
  * permission event.  cmdline_fp is the full-cmdline fingerprint exactly
  * as an event would compute it ("" = unverifiable, which never matches);
  * tests and the benchmark build it with sha512_string().
+ *
+ * The allow seam is boolean (1 match, 0 no match).  The deny seam is
+ * tri-state: 1 conclusive match, 0 no match, -1 inconclusive (the
+ * entry's path keys fit, it stores a binary SHA-512, and bin_sha512 is
+ * empty) -- the pipeline then skips grants and prompts.
  */
 int fanotify_test_dyn_allow_match(const char *binary, const char *bin_sha512,
                                   const char *target, const char *cmdline_fp);
@@ -372,7 +377,10 @@ void fanotify_test_recent_clear(void);
  * the synthetic context as a member of that session; cmdline_fp may be
  * NULL; hardlink mirrors the pipeline's hard-link classification (which
  * strips every grant); defer mirrors the pump's defer_on_ask mode (a
- * changed hash pin defers instead of opening a second dialog).
+ * changed hash pin defers instead of opening a second dialog).  An
+ * inconclusive deny (a deny entry whose stored digest cannot be checked
+ * against an empty bin_sha512) also returns 0: grants are gated, so the
+ * event prompts instead of being granted by a hash-free stage.
  */
 int fanotify_test_verdict_stage(const char *binary, const char *bin_sha512,
                                 const char *target, const char *cmdline_fp,

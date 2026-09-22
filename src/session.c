@@ -106,8 +106,10 @@ static int entry_expired(const SessionEntry *e, time_t now)
  * by the session leader, the binary path and the target, so the exposure
  * is session-scoped; a missing digest must NOT be turned back into a
  * fail-closed rejection (a past review did and broke the use case).
- * A recorded digest, however, must match: an unverifiable requester
- * digest re-prompts.
+ * A recorded digest, however, must match: when the requester's digest
+ * is unavailable the deny walker reports INCONCLUSIVE (see
+ * list_deny_match) and the allow walker treats it as a non-match, so
+ * neither side ever matches an unverifiable recorded digest outright.
  */
 static int hash_matches(const SessionEntry *e, const char *bin_sha512)
 {
@@ -176,10 +178,48 @@ int session_allow_match(pid_t sid, const char *binary, const char *bin_sha512,
     return list_match(g_allow, g_allow_count, sid, binary, bin_sha512, target);
 }
 
+/*
+ * Deny-side walk: the same path keys as list_match, but an unverifiable
+ * digest is reported instead of silently dropped.  hash_matches() already
+ * gives the two boolean outcomes -- a digest-less entry matches
+ * (conservative: it denies any digest at the same session/binary/target)
+ * and a verified mismatch does not -- and the one extra outcome is -1,
+ * INCONCLUSIVE: the entry pins a digest and the requester has none, so
+ * the denial can be neither verified nor refuted.  The caller
+ * (event_runtime_denied) then skips every grant stage and prompts:
+ * denying outright would punish an unverifiable identity, while falling
+ * through to grants could allow straight past a denial that may well
+ * fit.  Never returned for a hash failure alone -- only for an entry
+ * whose path keys already matched.  A conclusive match wins over a
+ * pending inconclusive one at any table position.
+ */
+static int list_deny_match(SessionEntry *list, int count, pid_t sid,
+                           const char *binary, const char *bin_sha512,
+                           const char *target)
+{
+    time_t now = mono_seconds();
+    int inconclusive = 0;
+
+    for (int i = 0; i < count; i++)
+    {
+        SessionEntry *e = &list[i];
+
+        if (!entry_covers(e, now, sid, binary, target))
+            continue;
+        if (hash_matches(e, bin_sha512))
+            return 1; /* conclusive: verified, or a digest-less entry */
+        if (e->binary_sha512[0] != '\0' &&
+            (!bin_sha512 || bin_sha512[0] == '\0'))
+            inconclusive = 1; /* path fits; stored digest unverifiable */
+    }
+    return inconclusive ? -1 : 0;
+}
+
 int session_deny_match(pid_t sid, const char *binary, const char *bin_sha512,
                        const char *target)
 {
-    return list_match(g_deny, g_deny_count, sid, binary, bin_sha512, target);
+    return list_deny_match(g_deny, g_deny_count, sid, binary, bin_sha512,
+                           target);
 }
 
 /*

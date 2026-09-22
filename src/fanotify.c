@@ -1192,11 +1192,16 @@ static int load_dyn_list(DynEntry *list, int *list_count,
  * two lists differ in exactly one admission point, require_binary_sha:
  *   - allow (1): an entry without a binary SHA-512 is skipped -- a grant
  *     must prove which binary was approved or it would act as a wildcard.
+ *     The return stays boolean: 1 match, 0 no match.
  *   - deny  (0): a legacy entry without a binary SHA-512 still matches; a
- *     missing *current* hash skips the entry (re-prompt) instead of
- *     denying on an unverified identity.
- * The command-line fingerprint is compared, not recomputed: the caller
- * produces it lazily so unrelated events never pay for the hash.
+ *     stored digest with no usable current hash is INCONCLUSIVE (return
+ *     -1), never a match and never a silent fall-through: the caller
+ *     skips every grant stage and prompts instead (fail closed).
+ * Returns 1 on a conclusive match, 0 on no match, -1 on an inconclusive
+ * deny (impossible when require_binary_sha is 1, so the allow side is
+ * always 0/1).  The command-line fingerprint is compared, not
+ * recomputed: the caller produces it lazily so unrelated events never
+ * pay for the hash.
  */
 typedef const ProcChain *(*ChainProviderFn)(void *ctx);
 
@@ -1216,6 +1221,8 @@ static int dyn_match(const DynEntry *list, int count,
                      CmdlineProviderFn cmdline_fn, void *cmdline_ctx,
                      int require_binary_sha)
 {
+    int inconclusive = 0;
+
     /* File-scoped matching: an event with no resolved target can never
      * match a persisted entry (admission always requires a target). */
     if (!target || target[0] == '\0')
@@ -1239,9 +1246,18 @@ static int dyn_match(const DynEntry *list, int count,
         else
         {
             /* A stored hash with no usable current hash cannot be
-             * verified, so the entry does not match (fail secure). */
+             * verified.  Grants skip the entry (no match); a deny marks
+             * the outcome INCONCLUSIVE instead, so the pipeline skips
+             * every grant stage and prompts (fail closed) rather than
+             * granting past a denial it could not check.  Never set for
+             * a hash failure alone: only for an entry whose path keys
+             * already matched. */
             if (bin_sha512[0] == '\0')
+            {
+                if (!require_binary_sha)
+                    inconclusive = 1;
                 continue;
+            }
             if (strcmp(e->binary_sha512, bin_sha512) != 0)
                 continue;
         }
@@ -1298,7 +1314,9 @@ static int dyn_match(const DynEntry *list, int count,
             continue;
         return 1;
     }
-    return 0;
+    /* A conclusive match always returns inside the loop, so a pending
+     * inconclusive observation can only surface when nothing matched. */
+    return inconclusive ? -1 : 0;
 }
 
 /* "Always Allow" lookup: grants are strict (see dyn_match). */
@@ -1435,8 +1453,11 @@ static void dyn_allow_add(const char *binary, const char *bin_sha512,
 
 /*
  * "Always Deny" lookup: denials may be broader than grants (legacy
- * entries without a binary hash still apply) but never match on an
- * identity that cannot be verified -- see dyn_match.
+ * entries without a binary hash still apply).  Tri-state like dyn_match:
+ * 1 conclusive match, 0 no match, -1 inconclusive (the entry's path keys
+ * fit, it stores a digest, and the current hash is unavailable) -- the
+ * caller then skips grants and prompts instead of denying on an
+ * unverified identity or granting past the denial.
  */
 static int dyn_deny_match(const char *binary, const char *bin_sha512,
                           ChainProviderFn chain_fn, void *chain_ctx,
@@ -2724,6 +2745,14 @@ typedef struct
      * second dialog — the caller queues the event with its fd open. */
     int defer_on_ask;
 
+    /* Set by event_runtime_denied() when a deny entry's path keys match
+     * but its stored digest cannot be checked against an unavailable
+     * current hash (INCONCLUSIVE): event_runtime_allowed() then skips
+     * every grant stage, so the event reaches the dialog (fail closed)
+     * instead of being granted by a hash-free stage such as the file
+     * cache or [unsafe_allowlist]. */
+    int deny_inconclusive;
+
     /* Requester identity, gathered after the pre-hash deny checks. */
     pid_t ppid;
     char comm[256];
@@ -3169,24 +3198,48 @@ void fanotify_test_reset_dialog_rate(void)
 
 static int event_runtime_denied(EventCtx *c)
 {
-    if (c->have_sid &&
-        session_deny_match(c->sid, c->binary, c->bin_sha512, c->target))
+    if (c->have_sid)
     {
-        log_msg(LOG_INFO, "session denylist hit: %s (pid %d, sid %d) -> %s",
-                c->binary, (int)c->ev->pid, (int)c->sid, c->target);
-        ctx_respond(c, FAN_DENY);
-        return 1;
+        int m = session_deny_match(c->sid, c->binary, c->bin_sha512,
+                                   c->target);
+
+        if (m == 1)
+        {
+            log_msg(LOG_INFO, "session denylist hit: %s (pid %d, sid %d) -> %s",
+                    c->binary, (int)c->ev->pid, (int)c->sid, c->target);
+            ctx_respond(c, FAN_DENY);
+            return 1;
+        }
+        if (m < 0)
+            c->deny_inconclusive = 1;
     }
 
-    if (g_dyn_deny_count > 0 &&
-        dyn_deny_match(c->binary, c->bin_sha512, event_chain_provider, c,
-                       c->target, event_cmdline_provider, c))
+    if (g_dyn_deny_count > 0)
     {
-        log_msg(LOG_INFO, "dynamic denylist hit: %s (pid %d) -> %s",
-                c->binary, (int)c->ev->pid, c->target);
-        ctx_respond(c, FAN_DENY);
-        return 1;
+        int m = dyn_deny_match(c->binary, c->bin_sha512, event_chain_provider,
+                               c, c->target, event_cmdline_provider, c);
+
+        if (m == 1)
+        {
+            log_msg(LOG_INFO, "dynamic denylist hit: %s (pid %d) -> %s",
+                    c->binary, (int)c->ev->pid, c->target);
+            ctx_respond(c, FAN_DENY);
+            return 1;
+        }
+        if (m < 0)
+            c->deny_inconclusive = 1;
     }
+
+    /* Inconclusive: no deny decided, but one may fit and cannot be
+     * verified.  Flag the context so the grant stages are skipped and
+     * the event reaches the dialog (fail closed); a conclusive deny
+     * would already have returned above. */
+    if (c->deny_inconclusive)
+        log_msg(LOG_INFO,
+                "deny entry matches %s (pid %d) but its stored digest is "
+                "unverifiable (SHA-512 unavailable); prompting instead of "
+                "falling through to grants",
+                c->binary, (int)c->ev->pid);
     return 0;
 }
 
@@ -3495,6 +3548,14 @@ static int try_pinned_allowlist(EventCtx *c)
  */
 static int event_runtime_allowed(EventCtx *c)
 {
+    /* An inconclusive deny (path keys fit, stored digest unverifiable)
+     * gates every grant stage: no hash-free grant -- file cache, session
+     * allow, runtime allow, [unsafe_allowlist] -- may decide while a
+     * denial that may well fit is waiting to be verified.  The caller
+     * reaches the dialog (fail closed). */
+    if (c->deny_inconclusive)
+        return 0;
+
     /*
      * A hard-link/unprotected-path event must not be resolved by a rule
      * scoped to a different path (or by a wildcard grant): force the

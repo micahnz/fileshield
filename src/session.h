@@ -51,13 +51,28 @@ void session_deny_add(pid_t sid, unsigned long long leader_start,
                       const char *target, int ttl_seconds);
 
 /*
- * Match a session-scoped entry.  Returns 1 on match, 0 otherwise.  An
- * entry without a stored digest matches any requester digest (deliberate
- * for unhashable binaries; see session_allow_add).  A recorded digest,
- * however, must match, and a missing requester digest for a recorded
- * entry re-prompts (fail closed: the approved binary cannot be verified).
- * A match also lazily drops entries whose leader exited, whose start time
- * changed, or whose TTL expired.
+ * Match a session-scoped entry.  A match also lazily drops entries whose
+ * leader exited, whose start time changed, or whose TTL expired.
+ *
+ * session_allow_match returns 1 on match, 0 otherwise.  An entry without
+ * a stored digest matches any requester digest (deliberate for
+ * unhashable binaries; see session_allow_add).  A recorded digest must
+ * match: a missing or different requester digest does not match, so the
+ * event falls through to the pipeline's later grant stages or to the
+ * dialog -- this matcher never denies and never prompts by itself.
+ *
+ * session_deny_match is tri-state:
+ *     1  conclusive match -- the path keys fit and the digest is
+ *        verified (or the entry stores no digest, which deliberately
+ *        matches any requester digest: conservative on this side)
+ *     0  no deny entry's path keys fit; a verified digest mismatch is
+ *        also a plain non-match (that entry does not apply)
+ *    -1  inconclusive -- a deny entry's path keys fit, it stores a
+ *        digest, and the requester's digest is empty (hash failure), so
+ *        the denial can be neither verified nor refuted.  The caller
+ *        must then skip every grant stage and prompt (fail closed):
+ *        never returned for a hash failure alone, without a
+ *        path-matching deny entry.
  */
 int session_allow_match(pid_t sid, const char *binary, const char *bin_sha512,
                         const char *target);
