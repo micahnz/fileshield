@@ -1039,10 +1039,9 @@ int notify_ask(const NotifyRequest *req)
     t.note[0] = '\0';
     if (req->hash_unavailable)
         snprintf(t.note, sizeof(t.note),
-                 "\n\nNote: the binary SHA-512 is unavailable (%s). "
-                 "\"Allow Always\" cannot persist for this binary - add it "
-                 "to [unsafe_allowlist] in fileshield.conf if it needs a "
-                 "permanent grant.",
+                 "\nNote: the binary SHA-512 is unavailable (%s). \n"
+                 "This means \"Allow Always\" cannot persist for this binary. Add it to [unsafe_allowlist] \n"
+                 "in fileshield.conf if it needs a permanent grant.",
                  req->hash_failure && req->hash_failure[0] != '\0'
                      ? req->hash_failure
                      : "hashing failed");
