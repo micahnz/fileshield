@@ -166,4 +166,14 @@ void notify_test_set_kdialog_path(const char *path);
  */
 int notify_test_html_escape(const char *in, char *out, size_t outsz);
 
+/*
+ * Test seam: hard-wrap one dialog body to 80 display columns exactly
+ * like both prompts do, so a long path or command line cannot widen the
+ * popup.  html=1 counts HTML tags as zero columns and entities as one
+ * glyph and breaks with <br>; html=0 wraps plain text with newlines.
+ * Returns 0 on success; -1 with out[0] == '\0' when outsz cannot hold
+ * the result (the caller then shows the unwrapped body).
+ */
+int notify_test_wrap_text(const char *in, char *out, size_t outsz, int html);
+
 #endif

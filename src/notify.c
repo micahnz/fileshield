@@ -690,6 +690,251 @@ int notify_test_html_escape(const char *in, char *out, size_t outsz)
     return html_escape(in, out, outsz);
 }
 
+/* ------------------------------------------------------------------ */
+/*  dialog body hard wrapping                                          */
+/* ------------------------------------------------------------------ */
+/*
+ * Hard limit for one rendered dialog line: a long path or command line
+ * must not widen the kdialog popup beyond this many display columns.
+ */
+#define DIALOG_TEXT_WIDTH 80
+
+/*
+ * 1 when an HTML tag opens a fresh rendered line (block or break
+ * element).  Only the inline elements the prompt builder emits keep the
+ * current column; anything unknown counts as a block, which can only
+ * wrap a line earlier, never later.
+ */
+static int html_tag_breaks_line(const char *tag, size_t len)
+{
+    static const char *const inline_tags[] = {
+        "a", "b", "i", "u", "em", "strong", "tt", "code", "span", "font",
+        "sub", "sup", "small", "big", NULL};
+    char name[16];
+    size_t k = 1;
+    size_t n = 0;
+
+    if (k < len && tag[k] == '/')
+        k++;
+    while (k < len && n + 1 < sizeof(name))
+    {
+        unsigned char c = (unsigned char)tag[k];
+
+        if (c >= 'A' && c <= 'Z')
+            c = (unsigned char)(c - 'A' + 'a');
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')))
+            break;
+        name[n++] = (char)c;
+        k++;
+    }
+    name[n] = '\0';
+
+    for (int i = 0; inline_tags[i] != NULL; i++)
+        if (strcmp(name, inline_tags[i]) == 0)
+            return 0;
+    return 1;
+}
+
+/*
+ * Length of the HTML entity starting at s, or 0 when s does not start
+ * one.  An entity counts as one visible column and must never be split,
+ * or the prompt would show its raw source text ("&amp;") to the user.
+ */
+static size_t html_entity_len(const char *s)
+{
+    static const char *const names[] = {
+        "amp", "lt", "gt", "quot", "apos", "nbsp", NULL};
+    size_t k;
+
+    if (s[0] != '&')
+        return 0;
+
+    k = 1;
+    if (s[k] == '#')
+    {
+        size_t digits = 0;
+
+        k++;
+        while (s[k] >= '0' && s[k] <= '9' && digits < 7)
+        {
+            k++;
+            digits++;
+        }
+        return (digits > 0 && s[k] == ';') ? k + 1 : 0;
+    }
+
+    for (int i = 0; names[i] != NULL; i++)
+    {
+        size_t l = strlen(names[i]);
+
+        if (strncmp(s + k, names[i], l) == 0 && s[k + l] == ';')
+            return k + l + 1;
+    }
+    return 0;
+}
+
+/*
+ * wrap_dialog_text: hard-wrap one dialog body to DIALOG_TEXT_WIDTH
+ * display columns so long file names and command lines cannot widen the
+ * popup.  The plain body break is '\n'; in html mode the break is
+ * '<br>', tags count zero columns, and entities and UTF-8 sequences
+ * count one column and are never split.  Existing newlines and block
+ * tags reset the column.  A line breaks at the last space at or before
+ * the limit; a token with no space (a long path) hard-breaks at the
+ * limit.
+ *
+ * Pure and cosmetic: returns 0 on success; on a capacity shortfall
+ * returns -1 with out[0] == '\0' so the caller keeps the unwrapped body
+ * rather than emit a clipped one.  Wrapping never affects a decision.
+ */
+static int wrap_dialog_text(const char *in, char *out, size_t outsz, int html)
+{
+    const char *br = html ? "<br>" : "\n";
+    const size_t blen = strlen(br);
+    size_t j = 0;                 /* next output byte                    */
+    size_t i = 0;                 /* next input byte                     */
+    int col = 0;                  /* display columns since the last break */
+    size_t space_out = (size_t)-1; /* output index of the line's last space */
+    int space_col = 0;            /* columns before that space           */
+
+    if (outsz == 0)
+        return -1;
+    out[0] = '\0';
+
+    while (in[i] != '\0')
+    {
+        size_t ulen = 1;
+        int width = 1;
+        int is_space = 0;
+        int new_line = 0;
+
+        if (in[i] == '\n')
+            new_line = 1;
+        else if (html && in[i] == '<')
+        {
+            size_t k = i + 1;
+
+            while (in[k] != '\0' && in[k] != '>' && k - i < 256)
+                k++;
+            if (in[k] == '>')
+            {
+                ulen = k - i + 1;
+                width = 0;
+                new_line = html_tag_breaks_line(in + i, ulen);
+            }
+        }
+        else if (html && in[i] == '&')
+        {
+            size_t e = html_entity_len(in + i);
+
+            if (e > 0)
+                ulen = e;
+        }
+        else if ((unsigned char)in[i] >= 0xC0)
+        {
+            /* One UTF-8 sequence = one column; copy it whole. */
+            while (ulen < 4 && ((unsigned char)in[i + ulen] & 0xC0) == 0x80)
+                ulen++;
+        }
+        else
+            is_space = (in[i] == ' ');
+
+        /* Newline or block tag: emit verbatim and restart the line. */
+        if (new_line)
+        {
+            if (j + ulen >= outsz)
+                goto overflow;
+            memcpy(out + j, in + i, ulen);
+            j += ulen;
+            out[j] = '\0';
+            col = 0;
+            space_out = (size_t)-1;
+            i += ulen;
+            continue;
+        }
+
+        /* Inline tag: zero columns, never split. */
+        if (width == 0)
+        {
+            if (j + ulen >= outsz)
+                goto overflow;
+            memcpy(out + j, in + i, ulen);
+            j += ulen;
+            out[j] = '\0';
+            i += ulen;
+            continue;
+        }
+
+        /* A space at the start of a line would sit against the wrap edge
+         * with nothing before it: drop it. */
+        if (is_space && col == 0)
+        {
+            i += ulen;
+            continue;
+        }
+
+        /* The line is full and another glyph follows: break at the last
+         * space on this line when there is one, otherwise hard-break at
+         * the limit (long paths and command tokens have no space). */
+        if (col >= DIALOG_TEXT_WIDTH)
+        {
+            if (space_out != (size_t)-1)
+            {
+                /* Replace the space with the break and shift the tail. */
+                if (j + blen >= outsz)
+                    goto overflow;
+                memmove(out + space_out + blen, out + space_out + 1,
+                        j - (space_out + 1));
+                memcpy(out + space_out, br, blen);
+                j += blen - 1;
+                out[j] = '\0';
+                col = col - space_col - 1;
+                space_out = (size_t)-1;
+            }
+            else
+            {
+                if (j + blen >= outsz)
+                    goto overflow;
+                memcpy(out + j, br, blen);
+                j += blen;
+                out[j] = '\0';
+                col = 0;
+            }
+            /* The space that hit the limit was the wrap point: drop it. */
+            if (is_space)
+            {
+                i += ulen;
+                continue;
+            }
+        }
+
+        if (j + ulen >= outsz)
+            goto overflow;
+        if (is_space)
+        {
+            space_out = j;
+            space_col = col;
+        }
+        memcpy(out + j, in + i, ulen);
+        j += ulen;
+        out[j] = '\0';
+        col++;
+        i += ulen;
+    }
+
+    return 0;
+
+overflow:
+    out[0] = '\0';
+    return -1;
+}
+
+/* Test seam (notify.h): the dialog body hard-wrapper. */
+int notify_test_wrap_text(const char *in, char *out, size_t outsz, int html)
+{
+    return wrap_dialog_text(in, out, outsz, html);
+}
+
 /*
  * One choice row of a kdialog --menu prompt: the tag is what kdialog
  * echoes to stdout when the user picks the row; the label is the
@@ -1040,8 +1285,8 @@ int notify_ask(const NotifyRequest *req)
     if (req->hash_unavailable)
         snprintf(t.note, sizeof(t.note),
                  "\nNote: the binary SHA-512 is unavailable (%s). \n"
-                 "This means \"Allow Always\" cannot persist for this binary. Add it to [unsafe_allowlist] \n"
-                 "in fileshield.conf if it needs a permanent grant.",
+                 "This means \"Allow Always\" cannot persist for this binary. "
+                 "Add it to [unsafe_allowlist] in fileshield.conf if it needs a permanent grant.",
                  req->hash_failure && req->hash_failure[0] != '\0'
                      ? req->hash_failure
                      : "hashing failed");
@@ -1157,6 +1402,7 @@ int notify_ask(const NotifyRequest *req)
     char e_note[280 * 5 + 1];
     char html[8192];
     const char *body = msg;
+    int body_html = 0;
 
     if (html_escape(t.comm, e_comm, sizeof(e_comm)) == 0 &&
         html_escape(t.pcomm, e_pcomm, sizeof(e_pcomm)) == 0 &&
@@ -1208,8 +1454,23 @@ int notify_ask(const NotifyRequest *req)
         /* Use the styled body only when it rendered completely; a
          * truncation keeps the plain fallback already pointed to. */
         if (need >= 0 && (size_t)need < sizeof(html))
+        {
             body = html;
+            body_html = 1;
+        }
     }
+
+    /* Hard-wrap the body to 80 columns so a long path, binary or command
+     * line cannot widen the popup.  A wrap failure keeps the unwrapped
+     * body: formatting is cosmetic and never changes the decision. */
+    char wrapped[10240];
+
+    if (wrap_dialog_text(body, wrapped, sizeof(wrapped), body_html) == 0)
+        body = wrapped;
+    else
+        log_msg(LOG_WARNING,
+                "dialog body could not be wrapped to %d columns; "
+                "showing it unwrapped", DIALOG_TEXT_WIDTH);
 
     /* Run the menu, then re-vet the returned tag: a zero exit alone is
      * not a grant (empty and unknown tokens map to NOTIFY_DENY). */
@@ -1331,6 +1592,19 @@ int notify_ask_hash_change(const NotifyHashChange *req)
         if (need >= 0 && (size_t)need < sizeof(body))
             body_text = body;
     }
+
+    /* Hard-wrap the body to 80 columns exactly like notify_ask(), so a
+     * long rule pattern or path cannot widen the popup.  A wrap failure
+     * keeps the unwrapped body; formatting never changes the decision. */
+    char wrapped[18432];
+
+    if (wrap_dialog_text(body_text, wrapped, sizeof(wrapped),
+                         body_text == body) == 0)
+        body_text = wrapped;
+    else
+        log_msg(LOG_WARNING,
+                "hash-change dialog body could not be wrapped to %d "
+                "columns; showing it unwrapped", DIALOG_TEXT_WIDTH);
 
     DisplaySession session;
     int have_session = detect_display_session(req->user_uid, &session);

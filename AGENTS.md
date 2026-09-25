@@ -21,7 +21,7 @@ Fileshield/
 │   ├── config.c / config.h      # parse fileshield.conf
 │   ├── cache.c / cache.h        # target-scoped, PID-keyed allow cache with TTL
 │   ├── session.c / session.h    # in-memory session-scoped allow/deny decisions
-│   ├── notify.c / notify.h      # kdialog-only menu popups (stdout tokens)
+│   ├── notify.c / notify.h      # kdialog-only 80-col menu popups (stdout tokens)
 │   ├── persist.c / persist.h    # runtime allow/deny JSON state files
 │   ├── pin.c / pin.h            # [allowlist] SHA-512 pins (TOFU, 256-entry table, change state)
 │   ├── reload.c / reload.h      # SIGHUP reload: mark install, state/pin loading, reject/rollback
@@ -71,7 +71,7 @@ Headers are the source of truth for signatures; this table is the map.
 | `config.c/h`   | INI parse (`[protected_paths]`, `[allowlist]`, `[unsafe_allowlist]`, `[denylist]`, `[settings]`; unknown sections refused), `~` expansion, canonicalization, glob pattern compile (static base + suffix, shared by protected paths and rule sides), `!` exclusions, TTL clamps                                                                                                          |
 | `cache.c/h`    | PID+target allow cache with TTL and PID-reuse check (`/proc/<pid>/stat` start time)                                                                                                                                                                                                                                                                           |
 | `session.c/h`  | POSIX-session-scoped allow/deny entries, leader-lifetime validity                                                                                                                                                                                                                                                                                             |
-| `notify.c/h`   | per-prompt session detection, user drop, environment whitelist, kdialog stages (including the hash-change prompt), fail-closed outcomes, fire-and-forget notify-send rule-hit notifications (dedup window + global flood cap)                                                                                                                                 |
+| `notify.c/h`   | per-prompt session detection, user drop, environment whitelist, kdialog stages (including the hash-change prompt), fail-closed outcomes, 80-column dialog body hard wrapping (`wrap_dialog_text`), fire-and-forget notify-send rule-hit notifications (dedup window + global flood cap)                                                                                                                                 |
 | `persist.c/h`  | atomic JSON save (0600, `O_EXCL` temp + rename; fsync failures fail the write), tolerant line parser with structural completeness check, fail-secure load                                                                                                                                                                                                        |
 | `pin.c/h`      | `[allowlist]` binary SHA-512 pins: strict fail-closed JSON load (missing = TOFU), 256-entry table with oldest-eviction, atomic store, change detection                                                                                                                                                                                                        |
 | `sha512.c/h`   | `sha512_file` (forked `sha512sum`, `sha512_last_failure()` reason accessor), `sha512_proc_exe`, in-process `sha512_string`/`sha512_buf`                                                                                                                                                                                                                       |
@@ -136,6 +136,16 @@ description: session = this binary and file until the session ends;
 always = saved permanently for this command and file.  The Deny Once row
 is preselected via `--default`: confirming with no deliberate selection
 denies this attempt -- an accidental Enter can never grant.
+
+Every dialog body is hard-wrapped to 80 display columns before kdialog
+runs (`wrap_dialog_text()`): the plain fallback breaks with newlines and
+the rich-text body with `<br>`; HTML tags count zero columns, entities
+and UTF-8 sequences count one and are never split, and a line breaks at
+the last space or hard-breaks a longer token, so a long path or command
+line can never widen the popup.  Wrapping is cosmetic -- a wrap failure
+falls back to the unwrapped body and never changes a decision.  Menu row
+labels (single-line by contract) and notify-send toast text (laid out by
+the notification daemon) are not wrapped.
 
 The dialog child forwards a whitelist of the user's session appearance
 variables (desktop identity, Qt theme/scale, locale, cursor) read from
@@ -202,7 +212,7 @@ it never hashes a binary and never opens a path.
 - **`test_sha512`**: FIPS 180-4 known-answer vectors, differential tests vs `sha512sum`, NUL-safe buffer hashing
 - **`test_inode`**: exact-key lookup, device separation, duplicates, clear, overflow degradation
 - **`test_reload`**: parse failure keeps the old config, a rejected reload keeps the old config published (unprivileged runs with `fan_fd = -1` cannot install marks, so the mark-set restoration itself is covered by the root canary), a failed rollback requests shutdown
-- **`test_fanotify`**: mark mask, deferred queue fail-closed flush, daemon queue-overflow flush, incomplete state entries dropped, command-line scoping, full-cmdline fingerprints, rule glob matching, unsafe-first ordering, pin verdicts, first-seen TOFU, damaged-pin fall-through, `created_at` preservation, legacy ID migration, remove/clear/prune mutations with write-failure restore, kernel queue saturation (root)
+- **`test_fanotify`**: mark mask, deferred queue fail-closed flush, daemon queue-overflow flush, incomplete state entries dropped, command-line scoping, full-cmdline fingerprints, rule glob matching, unsafe-first ordering, pin verdicts, first-seen TOFU, damaged-pin fall-through, `created_at` preservation, legacy ID migration, remove/clear/prune mutations with write-failure restore, dialog body hard wrapping (80-column boundary, space preference, UTF-8/entity/tag safety, long-path end-to-end), kernel queue saturation (root)
 - **`test_ruleid`**: canonical identity determinism, field boundaries, chain depth, collision nonces, pin IDs, prefix matching and lookups
 - **`test_prune`**: group detection (interleaved, key-field separation, hash fields not part of the key), malformed-entry exclusion, chain-depth boundary, capacity errors, apply validation and compaction
 - **`test_cli`**: fallback gate (only ENOENT/ECONNREFUSED reach the file path; EACCES never does), exit-code contract 0/1/2, non-tty confirmation without `-y`, clear/prune contacting a reachable daemon even when the state file shows zero entries (errno-injection + temp-socket seams; never touches `/run` or `/var/lib`)

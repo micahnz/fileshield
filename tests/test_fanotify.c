@@ -2141,6 +2141,47 @@ static void test_menu_end_to_end(void) {
                   "--default|Deny Once - block this access only") == 0,
            "no-selection confirm defaults to Deny Once (deny, never allow)");
 
+    /*
+     * Long spaceless fields must be hard-wrapped inside the real body:
+     * the 200-char path after "<b>Path:</b> <tt>" first moves to a
+     * fresh line at the space after the key (greedy word wrap), then
+     * the token itself hard-breaks at 80 columns — 80/80/40 visible
+     * columns.  An unwrapped path would widen the popup without bound.
+     */
+    char long_path[201];
+    memset(long_path, 'x', 200);
+    long_path[200] = '\0';
+    req.path = long_path;
+
+    ASSERT(setenv("FAKE_KDIALOG_MODE", "dump", 1) == 0,
+           "set dump mode for the long-path run");
+    ASSERT(notify_ask(&req) == NOTIFY_ALLOW_ONCE,
+           "long-path dump run still grants");
+    ASSERT(dlg_read_dump("menu-body.txt", dump, sizeof(dump)) > 0,
+           "long-path body dump written");
+
+    ASSERT(strstr(dump, "<b>Path:</b><br><tt>") != NULL,
+           "long path moves to a fresh line at the space after the key");
+
+    char long_wrapped[256];
+    size_t wpos = 0;
+    memset(long_wrapped + wpos, 'x', 80);
+    wpos += 80;
+    memcpy(long_wrapped + wpos, "<br>", 4);
+    wpos += 4;
+    memset(long_wrapped + wpos, 'x', 80);
+    wpos += 80;
+    memcpy(long_wrapped + wpos, "<br>", 4);
+    wpos += 4;
+    memset(long_wrapped + wpos, 'x', 40);
+    wpos += 40;
+    long_wrapped[wpos] = '\0';
+
+    ASSERT(strstr(dump, long_wrapped) != NULL,
+           "long path hard-breaks at 80/80/40 visible columns");
+    ASSERT(strstr(dump, long_path) == NULL,
+           "the raw 200-char path never reaches the body unwrapped");
+
     notify_test_set_kdialog_path(NULL);
 }
 
@@ -2307,6 +2348,110 @@ static void test_html_escape(void) {
                                    sizeof(tiny)) == -1,
            "undersized buffer reports truncation");
     ASSERT(tiny[0] == '\0', "truncated output is emptied, not half-written");
+}
+
+/*
+ * The dialog body hard-wrapper: every rendered line must fit 80 columns
+ * so a long path or command line cannot widen the popup.  Plain mode
+ * breaks with newlines; HTML mode counts tags as zero columns and
+ * entities/UTF-8 as one glyph and breaks with <br>; prose breaks at the
+ * last space, a spaceless token hard-breaks at the limit.
+ */
+static void test_wrap_dialog_text(void) {
+    char out[8192];
+    char line[512];
+
+    /* Short and empty input pass through byte-for-byte. */
+    ASSERT(notify_test_wrap_text("", out, sizeof(out), 0) == 0,
+           "wrap: empty input succeeds");
+    ASSERT(strcmp(out, "") == 0, "wrap: empty input stays empty");
+    ASSERT(notify_test_wrap_text("short line", out, sizeof(out), 0) == 0,
+           "wrap: short input succeeds");
+    ASSERT(strcmp(out, "short line") == 0, "wrap: short input unchanged");
+
+    /* Existing newlines survive; each line wraps on its own. */
+    ASSERT(notify_test_wrap_text("a\nb", out, sizeof(out), 0) == 0,
+           "wrap: newline input succeeds");
+    ASSERT(strcmp(out, "a\nb") == 0, "wrap: existing newlines preserved");
+
+    /* Exactly 80 columns fits; 81 hard-breaks at the limit. */
+    memset(line, 'x', 80);
+    line[80] = '\0';
+    ASSERT(notify_test_wrap_text(line, out, sizeof(out), 0) == 0,
+           "wrap: 80-column line succeeds");
+    ASSERT(strcmp(out, line) == 0, "wrap: 80 columns is not wrapped");
+
+    memset(line, 'x', 81);
+    line[81] = '\0';
+    ASSERT(notify_test_wrap_text(line, out, sizeof(out), 0) == 0,
+           "wrap: 81-column line succeeds");
+    ASSERT(strlen(out) == 82 && out[80] == '\n' && out[81] == 'x',
+           "wrap: spaceless 81 columns hard-breaks after 80");
+
+    /* Prose breaks at the last space at or before the limit. */
+    memset(line, 'x', 70);
+    line[70] = ' ';
+    memset(line + 71, 'y', 20);
+    line[91] = '\0';
+    ASSERT(notify_test_wrap_text(line, out, sizeof(out), 0) == 0,
+           "wrap: prose succeeds");
+    ASSERT(strlen(out) == 91 && out[70] == '\n' && out[71] == 'y' &&
+               out[90] == 'y',
+           "wrap: prose breaks at the space, both words stay whole");
+
+    /* UTF-8: a multi-byte glyph is one column and is never split. */
+    memset(line, 'x', 79);
+    memcpy(line + 79, "\xe2\x80\xa2", 3);
+    line[82] = 'y';
+    line[83] = '\0';
+    ASSERT(notify_test_wrap_text(line, out, sizeof(out), 0) == 0,
+           "wrap: UTF-8 input succeeds");
+    ASSERT(strlen(out) == 84 && memcmp(out + 79, "\xe2\x80\xa2", 3) == 0 &&
+               out[82] == '\n' && out[83] == 'y',
+           "wrap: UTF-8 sequence counts one column and is never split");
+
+    /* HTML: inline tags add no columns; entities count one glyph each
+     * and the break can never land inside one. */
+    ASSERT(notify_test_wrap_text("<b>abc</b>", out, sizeof(out), 1) == 0,
+           "wrap: html input succeeds");
+    ASSERT(strcmp(out, "<b>abc</b>") == 0,
+           "wrap: inline tags add no columns");
+
+    for (int i = 0; i < 81; i++)
+        memcpy(line + i * 5, "&amp;", 5);
+    line[405] = '\0';
+    ASSERT(notify_test_wrap_text(line, out, sizeof(out), 1) == 0,
+           "wrap: entity flood succeeds");
+    ASSERT(strlen(out) == 409 && memcmp(out + 400, "<br>", 4) == 0 &&
+               memcmp(out + 404, "&amp;", 5) == 0,
+           "wrap: the 81st entity wraps, entities stay whole");
+    ASSERT(strstr(out, "&am<br>") == NULL && strstr(out, "&<br>p") == NULL,
+           "wrap: no entity is split by the break");
+
+    /* Block tags and <br> restart the column. */
+    memset(line, 'x', 40);
+    memcpy(line + 40, "</p><p>", 7);
+    memset(line + 47, 'y', 80);
+    line[127] = '\0';
+    ASSERT(notify_test_wrap_text(line, out, sizeof(out), 1) == 0,
+           "wrap: block tag input succeeds");
+    ASSERT(strcmp(out, line) == 0, "wrap: block tags restart the column");
+
+    /* A long spaceless HTML token hard-breaks at the limit. */
+    memset(line, 'p', 100);
+    line[100] = '\0';
+    char tagline[128];
+    snprintf(tagline, sizeof(tagline), "<tt>%s</tt>", line);
+    ASSERT(notify_test_wrap_text(tagline, out, sizeof(out), 1) == 0,
+           "wrap: long html token succeeds");
+    ASSERT(strlen(out) == 113 && memcmp(out + 84, "<br>", 4) == 0,
+           "wrap: long html token hard-breaks after 80 columns");
+
+    /* Capacity shortfall: nothing half-written. */
+    char tiny[8];
+    ASSERT(notify_test_wrap_text(line, tiny, sizeof(tiny), 0) == -1,
+           "wrap: undersized buffer reports failure");
+    ASSERT(tiny[0] == '\0', "wrap: failed wrap leaves no partial output");
 }
 
 /*
@@ -4398,6 +4543,7 @@ int main(void) {
     test_menu_end_to_end();
     test_hash_change_prompt_escapes();
     test_html_escape();
+    test_wrap_dialog_text();
     test_verdict_stage_order();
     test_session_allow_without_digest_stored();
     test_inconclusive_deny_gates_grants();
